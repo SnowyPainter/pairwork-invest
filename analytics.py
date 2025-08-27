@@ -1,6 +1,6 @@
 # analytics.py
 from __future__ import annotations
-import os, math, warnings
+import os, math, warnings, json
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -18,14 +18,14 @@ BASE_OUTDIR = "reports/analytics"
 os.makedirs(BASE_OUTDIR, exist_ok=True)
 
 # 실험 설정: 다양한 horizon과 label_thresh 조합
-HORIZONS = [1, 2, 5]
-LABEL_THRESHOLDS = [0.1, 0.3]
+HORIZONS = [1]
+LABEL_THRESHOLDS = [0.05]
 
 BASE_CFG = dict(
     years=[2018, 2019, 2020, 2021],
     market="KR",
     feature_set="v3",               # v1 / v2 / v3 중 선택
-    label_task="regression",        # regression or classification
+    label_task="classification",        # regression or classification
     group_cols=["ticker"],
     date_col="date",                # 날짜 컬럼명에 맞춰 수정
     max_tickers=None,  # 섹터별로 제한하므로 전체 제한 해제
@@ -109,9 +109,81 @@ def spearman_ic(df: pd.DataFrame, features: List[str], target: str) -> pd.DataFr
         if len(s) < 10:
             ic = np.nan
         else:
-            ic = s[f].rank().corr(s[target].rank(), method="pearson")
+            try:
+                # 스피어만 상관계수 계산: rank().corr()의 결과가 scalar인지 확인
+                ic_series = s[f].rank().corr(s[target].rank())
+                # Series.corr()는 scalar를 반환하므로 float 변환
+                ic = float(ic_series)
+            except (ValueError, TypeError, AttributeError):
+                # 상관계수 계산 실패시 NaN 반환
+                ic = np.nan
         out.append((f, ic))
     return pd.DataFrame(out, columns=["feature", "IC"]).sort_values("IC", ascending=False)
+
+def remove_highly_correlated_features(df: pd.DataFrame, features: List[str], corr_threshold: float = 0.8) -> List[str]:
+    """
+    상관계수가 높은 피처들을 제거하여 다중공선성 문제를 완화
+    """
+    if len(features) <= 1:
+        return features
+
+    # 피처간 상관계수 계산
+    corr_matrix = safe_corr(df[features], method="spearman")
+
+    # 상관계수가 높은 피처 쌍 찾기
+    high_corr_pairs = []
+    for i in range(len(features)):
+        for j in range(i+1, len(features)):
+            if abs(corr_matrix.iloc[i, j]) > corr_threshold:
+                high_corr_pairs.append((features[i], features[j], abs(corr_matrix.iloc[i, j])))
+
+    # IC가 높은 피처를 우선적으로 유지
+    ic_scores = spearman_ic(df, features, df.columns[-1])  # target은 마지막 컬럼으로 가정
+    ic_dict = dict(zip(ic_scores['feature'], ic_scores['IC']))
+
+    # 제거할 피처 결정
+    to_remove = set()
+    for feat1, feat2, corr_val in high_corr_pairs:
+        # IC가 낮은 피처를 제거
+        if ic_dict.get(feat1, 0) >= ic_dict.get(feat2, 0):
+            to_remove.add(feat2)
+        else:
+            to_remove.add(feat1)
+
+    filtered_features = [f for f in features if f not in to_remove]
+
+    print(f"  상관계수 제거: {len(features)} -> {len(filtered_features)} 피처 (제거됨: {list(to_remove)})")
+
+    return filtered_features
+
+def analyze_rolling_ic_volatility(rolling_ic_df: pd.DataFrame) -> Dict:
+    """
+    롤링 IC 데이터프레임에서 변동성 분석
+    """
+    if rolling_ic_df.empty:
+        return {}
+
+    # 피처별로 그룹화하여 변동성 계산
+    volatility_stats = []
+    for feature in rolling_ic_df['feature'].unique():
+        feature_data = rolling_ic_df[rolling_ic_df['feature'] == feature]['IC'].dropna()
+
+        if len(feature_data) < 5:  # 최소 데이터 요구
+            continue
+
+        stats = {
+            'feature': feature,
+            'ic_mean': feature_data.mean(),
+            'ic_std': feature_data.std(),
+            'ic_min': feature_data.min(),
+            'ic_max': feature_data.max(),
+            'ic_volatility': feature_data.std() / (abs(feature_data.mean()) + 1e-9),  # 변동계수
+            'n_periods': len(feature_data),
+            'ic_stability': abs(feature_data.mean()) / (feature_data.std() + 1e-9)
+        }
+        volatility_stats.append(stats)
+
+    return pd.DataFrame(volatility_stats).sort_values('ic_stability', ascending=False)
 
 def rolling_ic(df: pd.DataFrame, date_col: str, features: List[str], target: str, window: int=60) -> pd.DataFrame:
     """
@@ -127,7 +199,11 @@ def rolling_ic(df: pd.DataFrame, date_col: str, features: List[str], target: str
         s = d[[date_col, f, target]].dropna()
         for i in range(window, len(s)+1):
             w = s.iloc[i-window:i]
-            ic = w[f].rank().corr(w[target].rank(), method="pearson")
+            try:
+                ic_series = w[f].rank().corr(w[target].rank())
+                ic = float(ic_series)
+            except (ValueError, TypeError, AttributeError):
+                ic = np.nan
             vals.append(ic)
             dates.append(w[date_col].iloc[-1])
         res.append(pd.DataFrame({date_col: dates, "feature": f, "IC": vals}))
@@ -193,11 +269,7 @@ def lightgbm_importance(df: pd.DataFrame, features: List[str], target: str, date
 # 섹터별 분석 함수들
 # -----------------------------
 def analyze_single_sector(sector_name: str, tickers: List[str], horizon: int, label_thresh: float) -> Dict:
-    """단일 섹터에 대한 분석을 수행하고 결과를 반환"""
-    target_col = f"futret_{horizon}"
-    
-    print(f"\n=== 분석 중: {sector_name} (horizon={horizon}, thresh={label_thresh}) ===")
-    
+    """단일 섹터에 대한 포괄적 분석을 수행하고 결과를 반환"""
     # 데이터셋 빌드
     try:
         df_pl = build_dataset(
@@ -209,27 +281,31 @@ def analyze_single_sector(sector_name: str, tickers: List[str], horizon: int, la
             label_horizon=horizon,
             tickers=tickers,  # 섹터별 종목만 필터링
             streaming_collect=False,
-            use_cache=False
+            use_cache=True
         )
     except Exception as e:
         print(f"데이터 빌드 실패: {sector_name} - {e}")
         return {}
-    
+
     if df_pl.height == 0:
         print(f"데이터 없음: {sector_name}")
         return {}
-    
+
     # 컬럼 분리
     cols = df_pl.columns
+    target_col = cols[-1]
     non_feat = set(BASE_CFG["group_cols"] + [BASE_CFG["date_col"], target_col])
     feature_cols = [c for c in cols if c not in non_feat and _is_num_dtype(df_pl[c].dtype)]
-    
+
+    print(f"\n=== 분석 중: {sector_name} (horizon={horizon}, thresh={label_thresh}) target={target_col} ===")
+
+
     if len(feature_cols) == 0:
         print(f"피처 없음: {sector_name}")
         return {}
-    
+
     print(f"  데이터: rows={df_pl.height:,}, tickers={df_pl['ticker'].n_unique()}, feats={len(feature_cols)}")
-    
+
     # 분석 결과 저장용
     results = {
         'sector': sector_name,
@@ -239,198 +315,146 @@ def analyze_single_sector(sector_name: str, tickers: List[str], horizon: int, la
         'n_tickers': df_pl['ticker'].n_unique(),
         'n_features': len(feature_cols)
     }
-    
-    # pandas 변환
-    pdf = to_pandas(df_pl.select([target_col] + feature_cols))
-    
+
+    # pandas 변환 (전체 데이터)
+    full_pdf = to_pandas(df_pl.select([BASE_CFG["date_col"], target_col] + feature_cols))
+
     # 1) 타깃과의 스피어만 IC
-    ic = spearman_ic(pdf, feature_cols, target_col)
+    ic = spearman_ic(full_pdf, feature_cols, target_col)
     if not ic.empty:
         results['mean_ic'] = ic['IC'].mean()
         results['median_ic'] = ic['IC'].median()
         results['top5_ic_mean'] = ic.head(5)['IC'].mean()
         results['best_feature'] = ic.iloc[0]['feature']
         results['best_ic'] = ic.iloc[0]['IC']
-    
-    # 2) LightGBM 피처 중요도
+
+    # 2) 상관계수 높은 피처 제거
+    filtered_features = remove_highly_correlated_features(full_pdf, feature_cols, corr_threshold=0.8)
+    results['n_features_after_corr_filter'] = len(filtered_features)
+
+    # 3) 롤링 IC 분석 (필터링된 피처 사용)
+    rolling_ic_df = None
+    rolling_volatility = None
     try:
-        imp = lightgbm_importance(
-            to_pandas(df_pl.select([BASE_CFG["date_col"], target_col] + feature_cols)),
-            feature_cols, target_col, BASE_CFG["date_col"], n_splits=3  # 빠른 분석을 위해 3-fold
-        )
+        rolling_ic_df = rolling_ic(full_pdf, BASE_CFG["date_col"], filtered_features, target_col, window=60)
+        if not rolling_ic_df.empty:
+            rolling_volatility = analyze_rolling_ic_volatility(rolling_ic_df)
+            if not rolling_volatility.empty:
+                results['rolling_ic_mean'] = rolling_volatility['ic_mean'].mean()
+                results['rolling_ic_volatility'] = rolling_volatility['ic_volatility'].mean()
+                results['most_stable_feature'] = rolling_volatility.iloc[0]['feature']
+                results['most_stable_ic'] = rolling_volatility.iloc[0]['ic_stability']
+    except Exception as e:
+        print(f"  롤링 IC 분석 실패: {e}")
+
+    # 4) LightGBM 피처 중요도 (필터링된 피처 사용)
+    imp = None
+    try:
+        imp = lightgbm_importance(full_pdf, filtered_features, target_col, BASE_CFG["date_col"], n_splits=3)
         if not imp.empty:
             results['lgbm_top_feature'] = imp.iloc[0]['feature']
             results['lgbm_top_gain'] = imp.iloc[0]['gain']
             results['lgbm_mean_gain'] = imp['gain'].mean()
     except Exception as e:
         print(f"  LightGBM 분석 실패: {e}")
-    
-    # 3) 파일 저장 - 섹터별 디렉토리 사용
+
+    # 5) VIF 분석 (다중공선성)
+    vif_df = None
+    try:
+        vif_df = compute_vif(full_pdf, filtered_features[:20])  # 상위 20개 피처만
+        if not vif_df.empty:
+            results['mean_vif'] = vif_df['vif'].mean()
+            results['max_vif'] = vif_df['vif'].max()
+            results['high_vif_features'] = (vif_df['vif'] > 5).sum()  # VIF > 5인 피처 수
+    except Exception as e:
+        print(f"  VIF 분석 실패: {e}")
+
+    # 6) 파일 저장 - 섹터별 디렉토리 사용
     sector_dirname = sector_name.replace('/', '_').replace(' ', '_')
     filename_prefix = f"h{horizon}__t{label_thresh}"
-    
+
     # IC 저장
     if not ic.empty:
         save_df(ic, f"ic__{filename_prefix}", sector_dir=sector_dirname)
-    
+
+    # 필터링된 IC 저장
+    if len(filtered_features) < len(feature_cols):
+        filtered_ic = spearman_ic(full_pdf, filtered_features, target_col)
+        if not filtered_ic.empty:
+            save_df(filtered_ic, f"ic_filtered__{filename_prefix}", sector_dir=sector_dirname)
+
+    # 롤링 IC 저장
+    if rolling_ic_df is not None and not rolling_ic_df.empty:
+        save_df(rolling_ic_df, f"rolling_ic__{filename_prefix}", sector_dir=sector_dirname)
+
+    # 롤링 IC 변동성 저장
+    if rolling_volatility is not None and not rolling_volatility.empty:
+        save_df(rolling_volatility, f"rolling_ic_volatility__{filename_prefix}", sector_dir=sector_dirname)
+
+    # LightGBM 중요도 저장
+    if imp is not None and not imp.empty:
+        save_df(imp, f"lgbm_importance__{filename_prefix}", sector_dir=sector_dirname)
+
+    # VIF 저장
+    if vif_df is not None and not vif_df.empty:
+        save_df(vif_df, f"vif__{filename_prefix}", sector_dir=sector_dirname)
+
     # 상위 피처들의 상관관계 히트맵
     if len(ic) >= 5:
         top_features = ic.head(10)['feature'].tolist()
         if len(top_features) >= 2:
-            corr_s = safe_corr(pdf[top_features], method="spearman")
+            corr_s = safe_corr(full_pdf[top_features], method="spearman")
             plot_heatmap(corr_s, f"{sector_name} Top Features Correlation", f"heatmap__{filename_prefix}", sector_dir=sector_dirname)
-    
+
     return results
 
-def generate_sector_comparison_report(all_results: List[Dict]):
-    """섹터 간 비교 리포트 생성"""
+def save_all_results_summary(all_results: List[Dict]):
+    """모든 분석 결과를 요약하여 저장"""
     if not all_results:
         return
-    
-    df_results = pd.DataFrame(all_results)
-    
-    # 1) 전체 결과 요약
-    save_df(df_results, "sector_comparison_summary")
-    
-    # 2) horizon별 최고 성과 섹터
-    for horizon in HORIZONS:
-        h_data = df_results[df_results['horizon'] == horizon]
-        if not h_data.empty:
-            # IC 기준 최고 섹터
-            best_ic = h_data.loc[h_data['mean_ic'].idxmax()] if 'mean_ic' in h_data.columns else None
-            if best_ic is not None:
-                print(f"\n[Horizon {horizon}] 최고 IC 섹터: {best_ic['sector']} (IC={best_ic['mean_ic']:.4f})")
-    
-    # 3) label_thresh별 최고 성과 섹터
-    for thresh in LABEL_THRESHOLDS:
-        t_data = df_results[df_results['label_thresh'] == thresh]
-        if not t_data.empty:
-            best_ic = t_data.loc[t_data['mean_ic'].idxmax()] if 'mean_ic' in t_data.columns else None
-            if best_ic is not None:
-                print(f"\n[Threshold {thresh}] 최고 IC 섹터: {best_ic['sector']} (IC={best_ic['mean_ic']:.4f})")
-    
-    # 4) 섹터별 horizon 안정성 분석
-    sector_stability = []
-    for sector in df_results['sector'].unique():
-        sector_data = df_results[df_results['sector'] == sector]
-        if len(sector_data) >= 3:  # 여러 horizon 결과가 있는 경우
-            ic_std = sector_data['mean_ic'].std() if 'mean_ic' in sector_data.columns else np.nan
-            ic_mean = sector_data['mean_ic'].mean() if 'mean_ic' in sector_data.columns else np.nan
-            sector_stability.append({
-                'sector': sector,
-                'ic_mean': ic_mean,
-                'ic_std': ic_std,
-                'stability_score': ic_mean / (ic_std + 1e-6) if not np.isnan(ic_std) else np.nan
-            })
-    
-    if sector_stability:
-        stability_df = pd.DataFrame(sector_stability).sort_values('stability_score', ascending=False)
-        save_df(stability_df, "sector_stability_analysis")
-        print(f"\n가장 안정적인 섹터: {stability_df.iloc[0]['sector']}")
 
-def create_sector_performance_visualization(all_results: List[Dict]):
-    """섹터 성과 시각화"""
-    if not all_results:
-        return
-    
     df_results = pd.DataFrame(all_results)
-    
-    # IC 성과 히트맵 (섹터 x horizon)
-    if 'mean_ic' in df_results.columns:
-        pivot_ic = df_results.pivot_table(
-            values='mean_ic', 
-            index='sector', 
-            columns='horizon', 
-            aggfunc='mean'
-        )
-        
-        if not pivot_ic.empty:
-            fig, ax = plt.subplots(figsize=(10, 8))
-            im = ax.imshow(pivot_ic.values, aspect='auto', cmap='RdYlBu_r')
-            ax.set_xticks(range(len(pivot_ic.columns)))
-            ax.set_xticklabels([f"H{h}" for h in pivot_ic.columns])
-            ax.set_yticks(range(len(pivot_ic.index)))
-            ax.set_yticklabels(pivot_ic.index, fontsize=8)
-            ax.set_title("Sector Performance by Horizon (Mean IC)", fontsize=12)
-            
-            # 값 표시
-            for i in range(len(pivot_ic.index)):
-                for j in range(len(pivot_ic.columns)):
-                    val = pivot_ic.iloc[i, j]
-                    if not np.isnan(val):
-                        ax.text(j, i, f'{val:.3f}', ha='center', va='center', fontsize=8)
-            
-            plt.colorbar(im, ax=ax)
-            plt.tight_layout()
-            
-            path = os.path.join(BASE_OUTDIR, "sector_performance_heatmap.png")
-            plt.savefig(path, dpi=200)
-            plt.close()
-            print(f"saved: {path}")
+    save_df(df_results, "all_results_summary")
+    print(f"\n=== 분석 완료 요약 ===")
+    print(f"총 분석 수: {len(all_results)}")
+    print(f"섹터 수: {df_results['sector'].n_unique()}")
+    print(f"평균 IC: {df_results.get('mean_ic', pd.Series()).mean():.4f}")
+    print(f"평균 롤링 IC: {df_results.get('rolling_ic_mean', pd.Series()).mean():.4f}")
+    print(f"평균 변동성: {df_results.get('rolling_ic_volatility', pd.Series()).mean():.4f}")
 
 # -----------------------------
 # 메인 분석 루틴
 # -----------------------------
 def main():
-    """섹터별 다중 조건 분석 실행"""
-    print("=== 섹터별 분석 시작 ===")
+    """섹터별 포괄적 분석 실행 - 모든 결과를 파일로 저장"""
+    print("=== 섹터별 포괄적 분석 시작 ===")
     print(f"분석 대상: {len(SECTORS)}개 섹터")
     print(f"Horizons: {HORIZONS}")
     print(f"Label thresholds: {LABEL_THRESHOLDS}")
-    
+
     all_results = []
-    
+
     # 모든 섹터 x horizon x threshold 조합 분석
     total_combinations = len(SECTORS) * len(HORIZONS) * len(LABEL_THRESHOLDS)
     current = 0
-    
+
     for sector_name, tickers in SECTORS.items():
         for horizon, label_thresh in product(HORIZONS, LABEL_THRESHOLDS):
             current += 1
             print(f"\n진행률: {current}/{total_combinations}")
-            
+
             result = analyze_single_sector(sector_name, tickers, horizon, label_thresh)
             if result:  # 결과가 있는 경우만 추가
                 all_results.append(result)
-    
-    # 결과 분석 및 리포트 생성
+
+    # 전체 결과 요약 저장
     print(f"\n=== 분석 완료: {len(all_results)}개 결과 ===")
-    
+
     if all_results:
-        generate_sector_comparison_report(all_results)
-        create_sector_performance_visualization(all_results)
-        
-        # 주요 발견사항 출력
-        df_results = pd.DataFrame(all_results)
-        
-        print("\n=== 주요 발견사항 ===")
-        
-        # 1) 전체 최고 성과 섹터
-        if 'mean_ic' in df_results.columns:
-            best_overall = df_results.loc[df_results['mean_ic'].idxmax()]
-            print(f"전체 최고 IC: {best_overall['sector']} (H{best_overall['horizon']}, T{best_overall['label_thresh']}) - IC={best_overall['mean_ic']:.4f}")
-        
-        # 2) 고수익 임계값(0.3)에서도 잘 되는 섹터
-        high_thresh_data = df_results[df_results['label_thresh'] == 0.3]
-        if not high_thresh_data.empty and 'mean_ic' in high_thresh_data.columns:
-            best_high_thresh = high_thresh_data.loc[high_thresh_data['mean_ic'].idxmax()]
-            print(f"고수익 임계값 최적 섹터: {best_high_thresh['sector']} (H{best_high_thresh['horizon']}) - IC={best_high_thresh['mean_ic']:.4f}")
-        
-        # 3) horizon 안정성이 좋은 섹터 (여러 horizon에서 일관된 성과)
-        stability_analysis = []
-        for sector in df_results['sector'].unique():
-            sector_data = df_results[df_results['sector'] == sector]
-            if len(sector_data) >= 3 and 'mean_ic' in sector_data.columns:
-                ic_mean = sector_data['mean_ic'].mean()
-                ic_std = sector_data['mean_ic'].std()
-                stability_analysis.append((sector, ic_mean, ic_std, ic_mean/(ic_std + 1e-6)))
-        
-        if stability_analysis:
-            stability_analysis.sort(key=lambda x: x[3], reverse=True)
-            best_stable = stability_analysis[0]
-            print(f"가장 안정적 섹터: {best_stable[0]} - 평균IC={best_stable[1]:.4f}, 안정성점수={best_stable[3]:.2f}")
-    
-    print("\n분석 완료!")
+        save_all_results_summary(all_results)
+
+    print("\n분석 완료! 각 섹터별 폴더에 모든 결과가 저장되었습니다.")
 
 if __name__ == "__main__":
     main()
+
