@@ -27,16 +27,25 @@ def add_core_features(lf: pl.LazyFrame) -> pl.LazyFrame:
             typical.alias("typical"),
         ])
         .with_columns([
-            # ATR14: True Range의 14일 이동평균
-            pl.col("tr_raw").rolling_mean(14).over(g).alias("atr14"),
+            # ATR: 다양한 윈도우 적용 (5, 10, 14일)
+            pl.col("tr_raw").rolling_mean(5).over(g).fill_null(pl.col("tr_raw")).alias("atr5"),
+            pl.col("tr_raw").rolling_mean(10).over(g).fill_null(pl.col("tr_raw").rolling_mean(5).over(g)).alias("atr10"),
+            pl.col("tr_raw").rolling_mean(14).over(g).fill_null(pl.col("tr_raw").rolling_mean(10).over(g)).alias("atr14"),
 
-            # VWAP20: Volume Weighted Average Price
-            (pl.col("typical") * vol).rolling_sum(20).over(g).alias("vwap_num"),
-            vol.rolling_sum(20).over(g).alias("vwap_den"),
+            # VWAP: 다양한 윈도우 적용 (10, 20일)
+            (pl.col("typical") * vol).rolling_sum(10).over(g).alias("vwap_num10"),
+            vol.rolling_sum(10).over(g).alias("vwap_den10"),
+            (pl.col("typical") * vol).rolling_sum(20).over(g).alias("vwap_num20"),
+            vol.rolling_sum(20).over(g).alias("vwap_den20"),
         ])
         .with_columns([
-            # VWAP20 최종 계산
-            (pl.col("vwap_num") / (pl.col("vwap_den") + 1e-9)).alias("vwap20"),
+            # VWAP 최종 계산 (null 대체 체인)
+            (pl.col("vwap_num10") / (pl.col("vwap_den10") + 1e-9)).alias("vwap10"),
+            (pl.col("vwap_num20") / (pl.col("vwap_den20") + 1e-9)).alias("vwap20_raw"),
+        ])
+        .with_columns([
+            # VWAP20에 null 대체 적용
+            pl.col("vwap20_raw").fill_null(pl.col("vwap10")).alias("vwap20"),
         ])
         .with_columns([
             # RSI 계산을 위한 gain/loss 계산
@@ -48,15 +57,22 @@ def add_core_features(lf: pl.LazyFrame) -> pl.LazyFrame:
             pl.when(pl.col("price_change") < 0).then(-pl.col("price_change")).otherwise(0.0).alias("loss_raw"),
         ])
         .with_columns([
-            # 14일 이동평균 적용
+            # RSI: 다양한 윈도우 적용 (5, 10, 14일)
+            pl.col("gain_raw").rolling_mean(5).over(g).fill_null(pl.col("gain_raw")).alias("gain5"),
+            pl.col("loss_raw").rolling_mean(5).over(g).fill_null(pl.col("loss_raw")).alias("loss5"),
+            pl.col("gain_raw").rolling_mean(10).over(g).alias("gain10"),
+            pl.col("loss_raw").rolling_mean(10).over(g).alias("loss10"),
             pl.col("gain_raw").rolling_mean(14).over(g).alias("gain14"),
             pl.col("loss_raw").rolling_mean(14).over(g).alias("loss14"),
         ])
         .with_columns([
-            # RSI14 최종 계산
-            (100 - 100/(1 + (pl.col("gain14")/(pl.col("loss14")+1e-9)))).alias("rsi14")
+            # RSI 계산 (null 대체 체인 적용)
+            (100 - 100/(1 + (pl.col("gain5")/(pl.col("loss5")+1e-9)))).alias("rsi5"),
+            (100 - 100/(1 + (pl.col("gain10").fill_null(pl.col("gain5"))/(pl.col("loss10").fill_null(pl.col("loss5"))+1e-9)))).alias("rsi10"),
+            (100 - 100/(1 + (pl.col("gain14").fill_null(pl.col("gain10"))/(pl.col("loss14").fill_null(pl.col("loss10"))+1e-9)))).alias("rsi14")
         ])
-        .drop(["tr_raw", "typical", "vwap_num", "vwap_den", "price_change", "gain_raw", "loss_raw", "gain14", "loss14"])
+        .drop(["tr_raw", "typical", "vwap_num10", "vwap_den10", "vwap_num20", "vwap_den20", "vwap20_raw", 
+               "price_change", "gain_raw", "loss_raw", "gain5", "loss5", "gain10", "loss10", "gain14", "loss14"])
     )
 
 
@@ -79,8 +95,8 @@ def _safe_div(a: pl.Expr, b: pl.Expr, eps: float=1e-9) -> pl.Expr:
 def add_v2_features(lf: pl.LazyFrame) -> pl.LazyFrame:
     g = "ticker"
 
-    W_S = [5, 10, 20, 50, 100, 200]
-    W_VWAP = [10, 20, 50]
+    W_S = [5, 10, 20, 50]
+    W_VWAP = [10, 20]
 
     return (
         lf
@@ -95,7 +111,7 @@ def add_v2_features(lf: pl.LazyFrame) -> pl.LazyFrame:
         .with_columns([
             (pl.col("close")/pl.col("close").shift(w).over(g)-1).alias(f"roc{w}") for w in [5,10,20]
         ])
-        # 3) RSI6 계산을 위한 중간 단계
+        # 3) RSI6 계산을 위한 중간 단계 (null 처리 강화)
         .with_columns([
             (pl.col("close") - pl.col("close").shift(1).over(g)).alias("price_change_6")
         ])
@@ -104,42 +120,59 @@ def add_v2_features(lf: pl.LazyFrame) -> pl.LazyFrame:
             pl.when(pl.col("price_change_6") < 0).then(-pl.col("price_change_6")).otherwise(0.0).alias("loss6_raw")
         ])
         .with_columns([
-            pl.col("gain6_raw").rolling_mean(6).over(g).alias("gain6"),
-            pl.col("loss6_raw").rolling_mean(6).over(g).alias("loss6")
+            pl.col("gain6_raw").rolling_mean(6).over(g).fill_null(pl.col("gain6_raw")).alias("gain6"),
+            pl.col("loss6_raw").rolling_mean(6).over(g).fill_null(pl.col("loss6_raw")).alias("loss6")
         ])
         .with_columns([
             (100 - 100/(1 + _safe_div(pl.col("gain6"), pl.col("loss6")))).alias("rsi6")
         ])
-        # 4) Stochastic 지표들
+        # 4) Stochastic 지표들 (다양한 윈도우 + null 처리)
         .with_columns([
+            pl.col("low").rolling_min(5).over(g).alias("lowest5"),
+            pl.col("high").rolling_max(5).over(g).alias("highest5"),
             pl.col("low").rolling_min(14).over(g).alias("lowest14"),
             pl.col("high").rolling_max(14).over(g).alias("highest14")
         ])
         .with_columns([
-            (_safe_div(pl.col("close") - pl.col("lowest14"), pl.col("highest14") - pl.col("lowest14")) * 100).alias("stochk14")
+            (_safe_div(pl.col("close") - pl.col("lowest5"), pl.col("highest5") - pl.col("lowest5")) * 100).alias("stochk5"),
+            (_safe_div(pl.col("close") - pl.col("lowest14"), pl.col("highest14") - pl.col("lowest14")) * 100).alias("stochk14_raw")
         ])
         .with_columns([
-            pl.col("stochk14").rolling_mean(3).over(g).alias("stochd14")
+            pl.col("stochk14_raw").fill_null(pl.col("stochk5")).alias("stochk14")
         ])
-        # 5) Williams %R
         .with_columns([
-            (-_safe_div(pl.col("highest14") - pl.col("close"), pl.col("highest14") - pl.col("lowest14")) * 100).alias("willr14")
+            pl.col("stochk14").rolling_mean(3).over(g).fill_null(pl.col("stochk14")).alias("stochd14")
         ])
-        # 6) CCI(20) 계산
+        # 5) Williams %R (null 대체 적용)
+        .with_columns([
+            (-_safe_div(pl.col("highest14") - pl.col("close"), pl.col("highest14") - pl.col("lowest14")) * 100).alias("willr14_raw"),
+            (-_safe_div(pl.col("highest5") - pl.col("close"), pl.col("highest5") - pl.col("lowest5")) * 100).alias("willr5")
+        ])
+        .with_columns([
+            pl.col("willr14_raw").fill_null(pl.col("willr5")).alias("willr14")
+        ])
+        # 6) CCI 계산 (다양한 윈도우 + null 처리)
         .with_columns([
             _tp().alias("tp")
         ])
         .with_columns([
+            pl.col("tp").rolling_mean(10).over(g).alias("sma_tp10"),
             pl.col("tp").rolling_mean(20).over(g).alias("sma_tp20")
         ])
         .with_columns([
-            (pl.col("tp") - pl.col("sma_tp20")).abs().alias("dev_tp")
+            (pl.col("tp") - pl.col("sma_tp10")).abs().alias("dev_tp10"),
+            (pl.col("tp") - pl.col("sma_tp20")).abs().alias("dev_tp20")
         ])
         .with_columns([
-            pl.col("dev_tp").rolling_mean(20).over(g).alias("md20")
+            pl.col("dev_tp10").rolling_mean(10).over(g).alias("md10"),
+            pl.col("dev_tp20").rolling_mean(20).over(g).alias("md20")
         ])
         .with_columns([
-            _safe_div(pl.col("tp") - pl.col("sma_tp20"), 0.015 * pl.col("md20")).alias("cci20")
+            _safe_div(pl.col("tp") - pl.col("sma_tp10"), 0.015 * pl.col("md10")).alias("cci10"),
+            _safe_div(pl.col("tp") - pl.col("sma_tp20"), 0.015 * pl.col("md20")).alias("cci20_raw")
+        ])
+        .with_columns([
+            pl.col("cci20_raw").fill_null(pl.col("cci10")).alias("cci20")
         ])
         # 7) MACD 지표
         .with_columns([
@@ -295,7 +328,8 @@ def add_v2_features(lf: pl.LazyFrame) -> pl.LazyFrame:
         # 21) 중간 컬럼들 정리
         .drop([
             "price_change_6", "gain6_raw", "loss6_raw", "gain6", "loss6",
-            "lowest14", "highest14", "tp", "sma_tp20", "dev_tp", "md20",
+            "lowest5", "highest5", "lowest14", "highest14", "stochk14_raw", "willr14_raw", "willr5",
+            "tp", "sma_tp10", "sma_tp20", "dev_tp10", "dev_tp20", "md10", "md20", "cci10", "cci20_raw",
             "ema12", "ema26", "parkinson_raw", "gk_raw", "tr", "obv_delta",
             "raw_flow", "pos_flow", "neg_flow", "pos_flow_sum14", "neg_flow_sum14", "mfr14",
             "mfm", "cmf_num", "cmf_den", "vol_ma20", "vol_std20", "day_range", "body", "gap",
@@ -303,9 +337,9 @@ def add_v2_features(lf: pl.LazyFrame) -> pl.LazyFrame:
             "obv_mean20", "vwap20_mean20", "obv_std20", "vwap20_std20",
             "close_vol_cov20", "obv_vwap_cov20", "d1", "d2"
         ])
-        # 22) NaN/Null 처리
+        # 22) NaN/Null 처리 완화 (forward fill + 0 대체)
         .with_columns([
-            pl.col(pl.FLOAT_DTYPES).fill_nan(None),
+            pl.col(pl.FLOAT_DTYPES).fill_nan(None).forward_fill().over(g).fill_null(0),
             pl.col(pl.INTEGER_DTYPES).fill_null(0)
         ])
     )
@@ -328,20 +362,33 @@ def add_v3_features(lf: pl.LazyFrame) -> pl.LazyFrame:
               .then(pl.col("down_move")).otherwise(0).alias("minus_dm")
         ])
         .with_columns([
+            pl.col("tr_v3").rolling_mean(5).over(g).alias("atr5_v3"),
             pl.col("tr_v3").rolling_mean(14).over(g).alias("atr14_v3"),
+            pl.col("plus_dm").rolling_sum(5).over(g).alias("plus_dm_sum5"),
             pl.col("plus_dm").rolling_sum(14).over(g).alias("plus_dm_sum14"),
+            pl.col("minus_dm").rolling_sum(5).over(g).alias("minus_dm_sum5"),
             pl.col("minus_dm").rolling_sum(14).over(g).alias("minus_dm_sum14")
         ])
         .with_columns([
-            (100 * _safe_div(pl.col("plus_dm_sum14"), pl.col("atr14_v3"))).alias("plus_di14"),
-            (100 * _safe_div(pl.col("minus_dm_sum14"), pl.col("atr14_v3"))).alias("minus_di14")
+            (100 * _safe_div(pl.col("plus_dm_sum5"), pl.col("atr5_v3"))).alias("plus_di5"),
+            (100 * _safe_div(pl.col("minus_dm_sum5"), pl.col("atr5_v3"))).alias("minus_di5"),
+            (100 * _safe_div(pl.col("plus_dm_sum14"), pl.col("atr14_v3"))).alias("plus_di14_raw"),
+            (100 * _safe_div(pl.col("minus_dm_sum14"), pl.col("atr14_v3"))).alias("minus_di14_raw")
+        ])
+        .with_columns([
+            pl.col("plus_di14_raw").fill_null(pl.col("plus_di5")).alias("plus_di14"),
+            pl.col("minus_di14_raw").fill_null(pl.col("minus_di5")).alias("minus_di14")
         ])
         .with_columns([
             (_safe_div((pl.col("plus_di14") - pl.col("minus_di14")).abs(), 
                       (pl.col("plus_di14") + pl.col("minus_di14"))) * 100).alias("dx")
         ])
         .with_columns([
-            pl.col("dx").rolling_mean(14).over(g).alias("adx14")
+            pl.col("dx").rolling_mean(5).over(g).alias("adx5"),
+            pl.col("dx").rolling_mean(14).over(g).alias("adx14_raw")
+        ])
+        .with_columns([
+            pl.col("adx14_raw").fill_null(pl.col("adx5")).alias("adx14")
         ])
         # V / V2 패턴 계산
         .with_columns([
@@ -349,11 +396,17 @@ def add_v3_features(lf: pl.LazyFrame) -> pl.LazyFrame:
                       / (pl.col("high")-pl.col("low")+1e-9)) * pl.col("volume"), 1).alias("mfm_vol")
         ])
         .with_columns([
+            pl.col("mfm_vol").rolling_sum(10).over(g).alias("mfm_vol_sum10"),
+            pl.col("volume").rolling_sum(10).over(g).alias("vol_sum10_v3"),
             pl.col("mfm_vol").rolling_sum(20).over(g).alias("mfm_vol_sum20"),
             pl.col("volume").rolling_sum(20).over(g).alias("vol_sum20_v3")
         ])
         .with_columns([
-            _safe_div(pl.col("mfm_vol_sum20"), pl.col("vol_sum20_v3")).alias("cmf20_v3")
+            _safe_div(pl.col("mfm_vol_sum10"), pl.col("vol_sum10_v3")).alias("cmf10_v3"),
+            _safe_div(pl.col("mfm_vol_sum20"), pl.col("vol_sum20_v3")).alias("cmf20_v3_raw")
+        ])
+        .with_columns([
+            pl.col("cmf20_v3_raw").fill_null(pl.col("cmf10_v3")).alias("cmf20_v3")
         ])
         .with_columns([
             pl.col("cmf20_v3").alias("v_pattern")
@@ -368,17 +421,23 @@ def add_v3_features(lf: pl.LazyFrame) -> pl.LazyFrame:
             pl.col("obv_delta_v3").cum_sum().over(g).alias("obv_v3")
         ])
         .with_columns([
+            (_tp() * pl.col("volume")).rolling_sum(10).over(g).alias("vwap_num10_v3"),
+            pl.col("volume").rolling_sum(10).over(g).alias("vwap_den10_v3"),
             (_tp() * pl.col("volume")).rolling_sum(20).over(g).alias("vwap_num_v3"),
             pl.col("volume").rolling_sum(20).over(g).alias("vwap_den_v3")
         ])
         .with_columns([
-            _safe_div(pl.col("vwap_num_v3"), pl.col("vwap_den_v3")).alias("vwap20_v3")
+            _safe_div(pl.col("vwap_num10_v3"), pl.col("vwap_den10_v3")).alias("vwap10_v3"),
+            _safe_div(pl.col("vwap_num_v3"), pl.col("vwap_den_v3")).alias("vwap20_v3_raw")
+        ])
+        .with_columns([
+            pl.col("vwap20_v3_raw").fill_null(pl.col("vwap10_v3")).alias("vwap20_v3")
         ])
         .with_columns([
             ((pl.col("obv_v3") - pl.col("obv_v3").shift(5).over(g)) * 
              (pl.col("close") - pl.col("vwap20_v3"))).alias("v2_pattern")
         ])
-        # RSI5 계산
+        # RSI5 계산 (null 처리 강화)
         .with_columns([
             (pl.col("close") - pl.col("close").shift(1).over(g)).alias("price_change_5")
         ])
@@ -387,11 +446,11 @@ def add_v3_features(lf: pl.LazyFrame) -> pl.LazyFrame:
             pl.when(pl.col("price_change_5") < 0).then(-pl.col("price_change_5")).otherwise(0.0).alias("loss5_raw")
         ])
         .with_columns([
-            pl.col("gain5_raw").rolling_mean(5).over(g).alias("gain5"),
-            pl.col("loss5_raw").rolling_mean(5).over(g).alias("loss5")
+            pl.col("gain5_raw").rolling_mean(5).over(g).fill_null(pl.col("gain5_raw")).alias("gain5_v3"),
+            pl.col("loss5_raw").rolling_mean(5).over(g).fill_null(pl.col("loss5_raw")).alias("loss5_v3")
         ])
         .with_columns([
-            (100 - 100 / (1 + _safe_div(pl.col("gain5"), pl.col("loss5")))).alias("rsi5")
+            (100 - 100 / (1 + _safe_div(pl.col("gain5_v3"), pl.col("loss5_v3")))).alias("rsi5")
         ])
         # EMA와 ATR 계산
         .with_columns([
@@ -411,15 +470,17 @@ def add_v3_features(lf: pl.LazyFrame) -> pl.LazyFrame:
         ])
         # 중간 컬럼들 정리
         .drop([
-            "tr_v3", "up_move", "down_move", "plus_dm", "minus_dm", "atr14_v3",
-            "plus_dm_sum14", "minus_dm_sum14", "dx", "mfm_vol", "mfm_vol_sum20", 
-            "vol_sum20_v3", "cmf20_v3", "obv_delta_v3", "obv_v3", "vwap_num_v3", 
-            "vwap_den_v3", "vwap20_v3", "price_change_5", "gain5_raw", "loss5_raw", 
-            "gain5", "loss5"
+            "tr_v3", "up_move", "down_move", "plus_dm", "minus_dm", 
+            "atr5_v3", "atr14_v3", "plus_dm_sum5", "plus_dm_sum14", "minus_dm_sum5", "minus_dm_sum14",
+            "plus_di5", "minus_di5", "plus_di14_raw", "minus_di14_raw", "adx5", "adx14_raw", "dx", 
+            "mfm_vol", "mfm_vol_sum10", "vol_sum10_v3", "mfm_vol_sum20", "vol_sum20_v3", 
+            "cmf10_v3", "cmf20_v3_raw", "cmf20_v3", "obv_delta_v3", "obv_v3", 
+            "vwap_num10_v3", "vwap_den10_v3", "vwap10_v3", "vwap_num_v3", "vwap_den_v3", "vwap20_v3_raw", "vwap20_v3", 
+            "price_change_5", "gain5_raw", "loss5_raw", "gain5_v3", "loss5_v3"
         ])
-        # NaN/Null 처리
+        # NaN/Null 처리 완화 (forward fill + 0 대체)
         .with_columns([
-            pl.col(pl.FLOAT_DTYPES).fill_nan(None),
+            pl.col(pl.FLOAT_DTYPES).fill_nan(None).forward_fill().over(g).fill_null(0),
             pl.col(pl.INTEGER_DTYPES).fill_null(0)
         ])
     )
@@ -431,4 +492,5 @@ def add_feature_set(lf: pl.LazyFrame, feature_set: str="v1") -> pl.LazyFrame:
         return add_v2_features(add_core_features(lf))
     if feature_set == "v3":
         return add_v3_features(add_v2_features(add_core_features(lf)))
+    raise ValueError(f"unknown feature_set: {feature_set}")
     raise ValueError(f"unknown feature_set: {feature_set}")

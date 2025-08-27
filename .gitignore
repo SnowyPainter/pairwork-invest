@@ -2,3 +2,4 @@ data/raw/
 data/silver/
 __pycache__/
 data/cache/
+data/silver_test/

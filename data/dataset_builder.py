@@ -61,7 +61,7 @@ def build_dataset(
 
     cache_root = cache_dir or os.path.join("data", "cache", "datasets")
     os.makedirs(cache_root, exist_ok=True)
-    cache_name = f"ds_y-{_years_key(years)}__m-{market or 'all'}__fs-{feature_set}__lt-{label_task}.parquet"
+    cache_name = f"ds_y-{_years_key(years)}__m-{market or 'all'}__fs-{feature_set}__lt-{label_task}__th-{label_thresh}__h-{label_horizon}.parquet"
     cache_path = os.path.join(cache_root, cache_name)
 
     if use_cache and os.path.exists(cache_path):
