@@ -77,6 +77,7 @@ def build_dataset(
     lf = scan_ohlcv()
     _quick_counts(lf, "scan")
     lf = filter_ohlcv(lf, market=market, exchanges=exchanges, tickers=tickers, years=years, start=start, end=end)
+    lf = lf.sort(["ticker","date"])
     _quick_counts(lf, "filter")
     lf = add_feature_set(lf, feature_set=feature_set)
     _quick_counts(lf, "features")
@@ -98,13 +99,7 @@ def build_dataset(
     BASE = {"date","ticker","market","exchange","open","high","low","close","adj_close","volume","turnover","year"}
     schema_names = lf.collect_schema().names()
     feat_cols = [c for c in schema_names if c not in BASE]
-
-    dbg = lf.select([pl.len().alias("_n"), *[pl.col(c).is_null().sum().alias(c) for c in feat_cols]]).collect()
-    n = int(dbg["_n"][0]) if dbg.height else 0
-    bad = [c for c in feat_cols if (n == 0) or (int(dbg[c][0]) >= 0.99*n)]
-    print("ALL-NULL(or ~ALL) features:", bad, "n=", n)
-
-
+    
     df = lf.collect(streaming=streaming_collect)
 
     if use_cache:

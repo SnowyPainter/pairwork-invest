@@ -163,7 +163,6 @@ def ingest_all(batch_rows: int = 200_000):
         if stem.lower() in {"code", "readme"}:  # 혹시 있을 메타 파일 스킵
             continue
         _process_csv_stream(f, kind="KR", ticker=stem, batch_rows=batch_rows)
-
     # 미국
     for f, exch in tqdm(us_groups, desc="US files", unit="file"):
         stem = f.stem.strip()
@@ -171,5 +170,5 @@ def ingest_all(batch_rows: int = 200_000):
             continue
         _process_csv_stream(f, kind="US", ticker=stem, exchange_hint=exch, batch_rows=batch_rows)
 
-# 실행 예:
-ingest_all(batch_rows=100_000)
+if __name__ == "__main__":
+    ingest_all(batch_rows=100_000)

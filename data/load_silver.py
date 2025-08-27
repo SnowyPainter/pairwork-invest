@@ -18,9 +18,7 @@ def scan_ohlcv() -> pl.LazyFrame:
         format="parquet",
         partitioning=ds.partitioning(PARTITION_SCHEMA, flavor="hive"),
     )
-    lf = pl.scan_pyarrow_dataset(dset).with_columns(
-        pl.col("symbol").alias("ticker")   # ticker 항상 보장
-    )
+    lf = pl.scan_pyarrow_dataset(dset)
     return lf
 
 def filter_ohlcv(
