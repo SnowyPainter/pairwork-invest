@@ -403,6 +403,15 @@ def main():
     MIN_DIRECTION_PROB = 0.6  # 방향 트리거 임계값
     MIN_EVENT_PROB = 0.5      # 이벤트 사이징 임계값
 
+    """
+    
+    “절대 임계값”을 버리고 “일별 분위수(quantile) 게이트”로
+    확률 절대값은 모델/기간/시장 상태에 따라 드리프트해. 그래서 그날의 상대적 상위만 쓰는 게 튼튼하다.
+
+    임계값은 “고정 숫자”가 아니라 훈련기간에서 자동 학습
+
+    """
+
     print(f"🔧 전략: Direction Classifier로 진입 결정, Event Detector로 포지션 사이징")
     print(f"📊 트리거 임계값: {MIN_DIRECTION_PROB}, 이벤트 임계값: {MIN_EVENT_PROB}")
     print(f"📊 신호 생성: 방향확률 × 일별 랭크 퍼센트")
