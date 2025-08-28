@@ -31,161 +31,102 @@ from backtester.backtester import (
     plot_rolling_sharpe, plot_contrib_by_ticker
 )
 
+def create_trigger_size_signals(
+    direction_model,
+    event_model,
+    df: pl.DataFrame,
+    min_direction_prob: float = 0.6,
+    min_event_prob: float = 0.6,
+) -> pl.DataFrame:
+    import numpy as np, time
+    start = time.time()
 
-def create_combined_signals(direction_model: DirectionClassifierLGBM, 
-                          event_model: EventDetectorLGBM, 
-                          df: pl.DataFrame,
-                          direction_weight: float = 0.6,
-                          event_weight: float = 0.4,
-                          min_event_prob: float = 0.3) -> pl.DataFrame:
-    """
-    Direction Classifier와 Event Detector의 신호를 결합
-    
-    Args:
-        direction_model: 방향 예측 모델
-        event_model: 이벤트 감지 모델  
-        df: 데이터프레임
-        direction_weight: 방향 예측 가중치
-        event_weight: 이벤트 감지 가중치
-        min_event_prob: 최소 이벤트 확률 (이 이상일 때만 거래)
-        
-    Returns:
-        통합 신호가 추가된 데이터프레임
-    """
-    print("[통합 신호 생성]")
-    start_time = time.time()
-    
-    # 이벤트 데이터만 필터링
-    event_df = df.filter(pl.col("label_1d_cls") != 0)
-    event_count = len(event_df)
-    
-    print(f"  이벤트 데이터: {event_count:,} 행")
-    
-    if event_count == 0:
-        print("  [경고] 이벤트 데이터가 없습니다!")
-        return df.with_columns(
-            signal_direction=pl.lit(0.0),
-            signal_event=pl.lit(0.0),
-            signal_combined=pl.lit(0.0)
-        )
-    
-    # 1. Direction Classifier 신호 생성
-    print("  방향 예측 신호 생성 중...")
-    direction_features = [f for f in SELECTED_FEATURES if f in event_df.columns]
-    if direction_features:
-        direction_X = event_df.select(direction_features).to_pandas().fillna(0.0)
-        _, direction_proba = direction_model.predict(direction_X)
-        
-        # 이진 분류인 경우 양수 클래스 확률 추출
-        if len(direction_proba.shape) == 2:
-            direction_signals = direction_proba[:, 1]
-        else:
-            direction_signals = direction_proba
+    base = df.with_row_count("rid", offset=0)
+
+    # 1) 확률 산출 (전 구간)
+    dir_feats = [f for f in SELECTED_FEATURES if f in df.columns]
+    if dir_feats:
+        Xd = df.select(dir_feats).to_pandas().fillna(0.0)
+        _, pdir_raw = direction_model.predict(Xd)
+        pdir = (pdir_raw[:,1] if getattr(pdir_raw, "ndim", 1)==2 else pdir_raw).astype(float)
     else:
-        print("    [경고] 방향 예측용 피처가 없습니다!")
-        direction_signals = np.zeros(event_count)
-    
-    # 2. Event Detector 신호 생성
-    print("  이벤트 감지 신호 생성 중...")
-    print(f"    모델이 가진 피처 수: {len(event_model.features)}")
+        pdir = np.zeros(df.height, float)
 
-    # 사용 가능한 피처 확인
-    available_features = [f for f in event_model.features if f in event_df.columns]
-    missing_features = [f for f in event_model.features if f not in event_df.columns]
-
-    print(f"    데이터에서 사용 가능한 피처: {len(available_features)}개")
-    if missing_features:
-        print(f"    누락된 피처: {len(missing_features)}개")
-        print(f"    누락 피처 샘플: {missing_features[:5]}")
-
-    if available_features:
-        print(f"    예측에 사용할 피처: {len(available_features)}개")
-        event_X = event_df.select(available_features).to_pandas().fillna(0.0)
-        _, event_proba = event_model.predict(event_X)
-        event_signals = event_proba
+    ev_feats = [f for f in getattr(event_model, "features", []) if f in df.columns]
+    if ev_feats:
+        Xe = df.select(ev_feats).to_pandas().fillna(0.0)
+        _, pev_raw = event_model.predict(Xe)
+        pev = (pev_raw[:,1] if getattr(pev_raw, "ndim", 1)==2 else pev_raw).astype(float)
     else:
-        print("    [경고] 이벤트 감지용 피처가 없습니다!")
-        event_signals = np.zeros(event_count)
-    
-    # 3. 신호 통합
-    print("  신호 통합 중...")
-    
-    # 가중 평균으로 통합
-    combined_signals = (direction_weight * direction_signals + 
-                       event_weight * event_signals)
+        pev = np.zeros(df.height, float)
 
-    # 이벤트 확률이 낮으면 신호 강도 감소
-    event_filter = event_signals >= min_event_prob
-    combined_signals = np.where(event_filter, combined_signals, combined_signals * 0.5)
-    
-    # 신호 통계
-    print(f"  신호 통계:")
-    print(f"    방향 신호 평균: {np.mean(direction_signals):.3f}")
-    print(f"    이벤트 신호 평균: {np.mean(event_signals):.3f}")
-    print(f"    통합 신호 평균: {np.mean(combined_signals):.3f}")
-    print(f"    강한 신호 (>0.6): {np.sum(combined_signals > 0.6):,}개")
-    print(f"    이벤트 필터 통과: {np.sum(event_filter):,}개")
-    
-    # 이벤트 데이터에 신호 추가
-    event_df_with_signals = event_df.with_columns([
-        pl.Series("signal_direction", direction_signals, dtype=pl.Float64),
-        pl.Series("signal_event", event_signals, dtype=pl.Float64),
-        pl.Series("signal_combined", combined_signals, dtype=pl.Float64)
+    work = base.with_columns([
+        pl.Series("signal_trigger", pdir, dtype=pl.Float64),
+        pl.Series("event_prob", pev, dtype=pl.Float64),
+    ])
+
+    # 2) 트리거 & 이벤트 게이트
+    work = work.with_columns([
+        (pl.col("signal_trigger") >= min_direction_prob).alias("gate_dir"),
+        (pl.col("event_prob")     >= min_event_prob).alias("gate_evt"),
+    ]).with_columns([
+        (pl.col("gate_dir") & pl.col("gate_evt")).alias("gate_all")
+    ])
+
+    # 4) 최종 스코어: trigger_prob × event_prob
+    work = work.with_columns([
+        (pl.col("signal_trigger") * pl.col("event_prob")).alias("score_raw")
     ])
     
-    # 전체 데이터에 병합
-    result_df = df.join(
-        event_df_with_signals.select(["date", "ticker", "signal_direction", "signal_event", "signal_combined"]),
-        on=["date", "ticker"],
-        how="left"
-    ).with_columns([
-        pl.col("signal_direction").fill_null(0.0),
-        pl.col("signal_event").fill_null(0.0),
-        pl.col("signal_combined").fill_null(0.0)
+    # 8) 최종 신호
+    work = work.with_columns([
+        (pl.col("gate_all")).alias("final_signal"),
+        pl.col("signal_trigger").alias("signal_trigger_prob"),
+        pl.col("event_prob").alias("signal_event_prob"),
     ])
-    
-    signal_time = time.time() - start_time
-    print(f"  소요시간: {signal_time:.2f}초")
-    
-    return result_df
+
+    out = df.with_row_count("rid", offset=0).join(
+        work.select(["rid","signal_trigger_prob","signal_event_prob","final_signal"]),
+        on="rid", how="left"
+    ).drop("rid")
+
+    return out
 
 
-def run_combined_backtest(market: str = "KR",
-                         years_train: list = [2018, 2019, 2020],
-                         years_test: list = [2021],
-                         max_tickers: int = 50,
-                         top_positions: int = 10,
-                         direction_weight: float = 0.6,
-                         event_weight: float = 0.4,
-                         min_signal_threshold: float = 0.5,
-                         min_event_prob: float = 0.3) -> dict:
+def run_trigger_size_backtest(market: str = "KR",
+                           years_train: list = [2018, 2019, 2020],
+                           years_test: list = [2021],
+                           max_tickers: int = 50,
+                           top_positions: int = 10,
+                           min_direction_prob: float = 0.5,
+                           min_event_prob: float = 0.3) -> dict:
     """
-    통합 모델 백테스트 실행
-    
+    트리거 + 사이징 모델 백테스트 실행
+
+    - Direction Classifier: 진입 트리거 (방향 예측)
+    - Event Detector: 포지션 사이징 (이벤트 강도)
+
     Args:
         market: 시장 코드
         years_train: 학습 연도
         years_test: 테스트 연도
         max_tickers: 최대 종목 수
         top_positions: 상위 포지션 수
-        direction_weight: 방향 예측 가중치
-        event_weight: 이벤트 감지 가중치
-        min_signal_threshold: 최소 신호 임계값
-        min_event_prob: 최소 이벤트 확률
-        
+        min_direction_prob: 최소 방향 확률 (진입 트리거)
+        min_event_prob: 최소 이벤트 확률 (포지션 사이징)
+
     Returns:
         백테스트 결과
     """
-    print("[통합 모델 백테스트]")
+    print("[트리거 + 사이징 모델 백테스트]")
     print("=" * 60)
     print(f"  시장: {market}")
     print(f"  학습 연도: {years_train}")
     print(f"  테스트 연도: {years_test}")
     print(f"  최대 종목: {max_tickers}개")
     print(f"  상위 포지션: {top_positions}개")
-    print(f"  방향/이벤트 가중치: {direction_weight:.1f}/{event_weight:.1f}")
-    print(f"  신호 임계값: {min_signal_threshold}")
-    print(f"  이벤트 확률 임계값: {min_event_prob}")
+    print(f"  방향 트리거 임계값: {min_direction_prob}")
+    print(f"  이벤트 사이징 임계값: {min_event_prob}")
     print("=" * 60)
     
     start_time = time.time()
@@ -248,22 +189,21 @@ def run_combined_backtest(market: str = "KR",
     test_df = event_model._generate_regime_features(test_df)
     print(f"  향상된 피처 적용 후 컬럼 수: {len(test_df.columns)}개")
     
-    # 4. 통합 신호 생성
-    print("\n[통합 신호 생성]")
-    test_df_with_signals = create_combined_signals(
+    # 4. 트리거 + 사이징 신호 생성
+    print("\n[트리거 + 사이징 신호 생성]")
+    test_df_with_signals = create_trigger_size_signals(
         direction_model=direction_model,
         event_model=event_model,
         df=test_df,
-        direction_weight=direction_weight,
-        event_weight=event_weight,
+        min_direction_prob=min_direction_prob,
         min_event_prob=min_event_prob
     )
     
-    # 5. 백테스트 설정 (더 관대하게)
+    # 5. 백테스트 설정 (트리거 + 사이징용)
     print("\n[백테스트 설정]")
     config = BacktestConfig(
         label_col="futret_1",
-        signal_col="signal_combined",
+        signal_col="final_signal",
         universe=UniverseRule(
             top_k_per_day=max_tickers,
             min_turnover=1e3,
@@ -271,7 +211,7 @@ def run_combined_backtest(market: str = "KR",
         ),
         signal=SignalRule(
             select_top_n=top_positions,
-            min_threshold=min_signal_threshold,  # 임계값을 매우 낮게 설정
+            min_threshold=min_event_prob,  # 이벤트 사이징 임계값 사용
             long_only=True
         ),
         execution=ExecutionRule(mode="next_open_to_close"),
@@ -281,11 +221,12 @@ def run_combined_backtest(market: str = "KR",
             slippage_bps=5.0,
             capital_per_position=1_000_000
         ),
-        outdir=Path("reports/backtest_combined")
+        outdir=Path("reports/backtest_trigger_size")
     )
-    
-    print(f"  설정된 임계값: {config.signal.min_threshold} (원래 요청: {min_signal_threshold})")
-    print(f"  유니버스 크기: {config.universe.top_k_per_day} (원래: {max_tickers})")
+
+    print(f"  신호 컬럼: {config.signal_col}")
+    print(f"  설정된 임계값: {config.signal.min_threshold}")
+    print(f"  유니버스 크기: {config.universe.top_k_per_day}")
     print(f"  최소 거래대금: {config.universe.min_turnover:,}원")
     print(f"  최소 가격: {config.universe.min_price}원")
     
@@ -309,15 +250,17 @@ def run_combined_backtest(market: str = "KR",
         
         # 8. 신호별 성과 분석 및 디버깅
         print("\n  신호 필터링 과정 분석:")
-        
+
         # 각 단계별 필터링 현황
         total_data = len(test_df_with_signals)
-        has_signal = test_df_with_signals.filter(pl.col("signal_combined") > 0).height
-        strong_signal = test_df_with_signals.filter(pl.col("signal_combined") > min_signal_threshold).height
-        
+        has_trigger = test_df_with_signals.filter(pl.col("signal_trigger_prob") >= min_direction_prob).height
+        has_event = test_df_with_signals.filter(pl.col("signal_event_prob") >= min_event_prob).height
+        final_signals = test_df_with_signals.filter(pl.col("final_signal") > 0).height
+
         print(f"    전체 데이터: {total_data:,} 행")
-        print(f"    신호 있음 (>0): {has_signal:,} 행")
-        print(f"    강한 신호 (>{min_signal_threshold}): {strong_signal:,} 행")
+        print(f"    방향 트리거 활성화: {has_trigger:,} 행 (≥{min_direction_prob})")
+        print(f"    이벤트 사이징 활성화: {has_event:,} 행 (≥{min_event_prob})")
+        print(f"    최종 신호: {final_signals:,} 행 (>0)")
         
         # 백테스터 결과에서 선택된 데이터 분석
         if "daily" in result and len(result["daily"]) > 0:
@@ -366,19 +309,20 @@ def run_combined_backtest(market: str = "KR",
                     backtest_return = final_equity - 1
                     print(f"    백테스터 최종 수익률: {backtest_return:.4f} ({backtest_return*100:.2f}%)")
                 # 실제 선택된 거래의 신호 분석
-                signal_col = config.signal_col
-                if signal_col in selected_pd.columns and "futret_1" in selected_pd.columns:
-                    signal_corr = selected_pd[signal_col].corr(selected_pd["futret_1"])
-                    print(f"    선택된 거래의 신호-수익률 상관관계: {signal_corr:.3f}")
-                    
+                if "final_signal" in selected_pd.columns and "futret_1" in selected_pd.columns:
                     print(f"    선택된 거래 신호 통계:")
-                    print(f"      평균: {selected_pd[signal_col].mean():.3f}")
-                    print(f"      범위: {selected_pd[signal_col].min():.3f} ~ {selected_pd[signal_col].max():.3f}")
-                    
+                    print(f"      최종 신호 평균: {selected_pd['final_signal'].mean():.3f}")
+                    print(f"      최종 신호 범위: {selected_pd['final_signal'].min():.3f} ~ {selected_pd['final_signal'].max():.3f}")
+
+                    if "signal_trigger_prob" in selected_pd.columns:
+                        print(f"      방향 트리거 평균: {selected_pd['signal_trigger_prob'].mean():.3f}")
+                    if "signal_event_prob" in selected_pd.columns:
+                        print(f"      이벤트 확률 평균: {selected_pd['signal_event_prob'].mean():.3f}")
+
                     print(f"    선택된 거래 수익률 통계:")
                     print(f"      평균: {selected_pd['futret_1'].mean():.4f} ({selected_pd['futret_1'].mean()*100:.2f}%)")
                     print(f"      범위: {selected_pd['futret_1'].min():.4f} ~ {selected_pd['futret_1'].max():.4f}")
-                    
+
                     # 일별 거래 분포
                     daily_trades = selected_pd.groupby('date').size()
                     print(f"    일별 거래 분포:")
@@ -391,20 +335,32 @@ def run_combined_backtest(market: str = "KR",
         # 입력 데이터 디버깅
         print(f"\n  입력 데이터 체크:")
         print(f"    컬럼: {list(test_df_with_signals.columns)}")
-        
-        # 강한 신호 분석
+
+        # 신호별 상세 통계
+        print(f"\n  신호별 상세 통계:")
+        if "signal_trigger_prob" in test_df_with_signals.columns:
+            trigger_mean = test_df_with_signals.select(pl.col("signal_trigger_prob").mean()).item()
+            print(f"    방향 트리거 평균: {trigger_mean:.3f}")
+        if "signal_event_prob" in test_df_with_signals.columns:
+            event_mean = test_df_with_signals.select(pl.col("signal_event_prob").mean()).item()
+            print(f"    이벤트 확률 평균: {event_mean:.3f}")
+        if "final_signal" in test_df_with_signals.columns:
+            final_mean = test_df_with_signals.select(pl.col("final_signal").mean()).item()
+            print(f"    최종 신호 평균: {final_mean:.3f}")
+
+        # 강한 신호 분석 (최종 신호가 높은 경우)
         strong_signal_data = test_df_with_signals.filter(
-            pl.col("signal_combined") > min_signal_threshold
+            pl.col("final_signal") >= min_event_prob
         )
-        
+
         if len(strong_signal_data) > 0:
             print(f"    강한 신호 데이터 ({len(strong_signal_data)}개):")
-            
+
             # 상위 몇 개 신호 출력
-            top_signals = strong_signal_data.sort("signal_combined", descending=True).head(5)
+            top_signals = strong_signal_data.sort("final_signal", descending=True).head(5)
             print("    상위 5개 신호:")
             for row in top_signals.to_dicts():
-                print(f"      {row['date']} {row['ticker']}: signal={row['signal_combined']:.3f}, ret={row['futret_1']:.4f}")
+                print(f"      {row['date']} {row['ticker']}: final={row['final_signal']:.3f}, trigger={row.get('signal_trigger_prob', 0):.3f}, event_prob={row.get('signal_event_prob', 0):.3f}, ret={row['futret_1']:.4f}")
         else:
             print("    강한 신호 데이터가 없습니다.")
         
@@ -434,8 +390,8 @@ def run_combined_backtest(market: str = "KR",
 
 def main():
     """메인 함수"""
-    print("🎯 Combined Models Backtest")
-    print("Direction Classifier + Event Detector (향상된 피처)")
+    print("🎯 Trigger + Sizing Models Backtest")
+    print("Direction Classifier (트리거) + Event Detector (사이징)")
     print("=" * 60)
 
     # 설정
@@ -444,30 +400,27 @@ def main():
     TEST_YEARS = [2021]
     MAX_TICKERS = 50
     TOP_POSITIONS = 10
-    DIRECTION_WEIGHT = 0.5
-    EVENT_WEIGHT = 0.5
-    MIN_SIGNAL_THRESHOLD = 0.5
-    MIN_EVENT_PROB = 0.3
+    MIN_DIRECTION_PROB = 0.6  # 방향 트리거 임계값
+    MIN_EVENT_PROB = 0.5      # 이벤트 사이징 임계값
 
-    print(f"🔧 Event Detector: 향상된 피처 세트 사용 (상관관계 + 단기 V-score 패턴)")
-    print(f"📊 예상 피처 수: 95개 (기존 67개 + 28개 향상)")
-    
+    print(f"🔧 전략: Direction Classifier로 진입 결정, Event Detector로 포지션 사이징")
+    print(f"📊 트리거 임계값: {MIN_DIRECTION_PROB}, 이벤트 임계값: {MIN_EVENT_PROB}")
+    print(f"📊 신호 생성: 방향확률 × 일별 랭크 퍼센트")
+
     try:
-        result = run_combined_backtest(
+        result = run_trigger_size_backtest(
             market=MARKET,
             years_train=TRAIN_YEARS,
             years_test=TEST_YEARS,
             max_tickers=MAX_TICKERS,
             top_positions=TOP_POSITIONS,
-            direction_weight=DIRECTION_WEIGHT,
-            event_weight=EVENT_WEIGHT,
-            min_signal_threshold=MIN_SIGNAL_THRESHOLD,
+            min_direction_prob=MIN_DIRECTION_PROB,
             min_event_prob=MIN_EVENT_PROB
         )
         
         if result:
-            print("\n🎉 통합 모델 백테스트 완료!")
-            print("📁 결과는 reports/backtest_combined/ 에서 확인하세요")
+            print("\n🎉 트리거 + 사이징 모델 백테스트 완료!")
+            print("📁 결과는 reports/backtest_trigger_size/ 에서 확인하세요")
         else:
             print("\n❌ 백테스트 실패")
             

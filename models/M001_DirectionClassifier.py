@@ -29,15 +29,35 @@ from data.dataset_builder import build_dataset
 
 # === Feature Selection (다중공선성 고려) ===
 SELECTED_FEATURES = [
-    # RSI 그룹 (rsi14 선택 - 가장 안정적)
+    # 수익률 그룹 (roc10 선택 - 가장 높은 중요도)
+    'roc10',
+
+    # CCI 그룹 (cci20 선택 - 두 번째로 높은 중요도)
+    'cci20',
+
+    # Williams %R (willr14 선택 - 세 번째로 높은 중요도)
+    'willr14',
+
+    # OBV 그룹 (obv 선택 - On Balance Volume, 네 번째 중요도)
+    'obv',
+
+    # ATR 그룹 (atr14 선택 - 다섯 번째 중요도)
+    'atr14',
+
+    # MACD 그룹 (macd_hist 선택 - 히스토그램, 여섯 번째 중요도)
+    'macd_hist',
+
+    # RSI 그룹 (rsi14 선택 - 일곱 번째 중요도)
     'rsi14',
 
-    # 이동평균 그룹 (ema20, sma50 선택 - 장단기 균형)
-    'ema20',
-    'sma50',
+    # MFI 그룹 (mfi14 선택 - 여덟 번째 중요도)
+    'mfi14',
 
-    # 수익률 그룹 (roc10 선택 - 적절한 기간)
-    'roc10',
+    # Donchian 채널 (pos_in_don20 선택 - 아홉 번째 중요도)
+    'pos_in_don20',
+
+    # 변동성 그룹 (parkinson20 선택 - Parkinson 변동성, 열 번째 중요도)
+    'parkinson20',
 
     # 스토캐스틱 그룹 (stochd14 선택 - smoothed 버전)
     'stochd14',
@@ -45,32 +65,8 @@ SELECTED_FEATURES = [
     # 거래량 그룹 (vol_z20 선택 - 표준화된 변동성)
     'vol_z20',
 
-    # 변동성 그룹 (parkinson20 선택 - Parkinson 변동성)
-    'parkinson20',
-
-    # MACD 그룹 (macd_hist 선택 - 히스토그램)
-    'macd_hist',
-
-    # ATR 그룹 (atr14 선택 - 안정적)
-    'atr14',
-
     # VWAP 그룹 (vwap20 선택 - 더 긴 기간)
-    'vwap20',
-
-    # 가격 구조 (pos_in_don20 선택 - Donchian position)
-    'pos_in_don20',
-
-    # OBV 그룹 (obv 선택 - On Balance Volume)
-    'obv',
-
-    # MFI 그룹 (mfi14 선택)
-    'mfi14',
-
-    # CCI 그룹 (cci20 선택)
-    'cci20',
-
-    # Williams %R (willr14 선택)
-    'willr14'
+    'vwap20'
 ]
 
 class DirectionClassifierLGBM:
@@ -191,9 +187,10 @@ class DirectionClassifierLGBM:
               y: pd.Series,
               test_size: float = 0.2,
               use_cv: bool = True,
-              cv_folds: int = 5) -> Dict:
+              cv_folds: int = 5,
+              validation_years: Optional[List[int]] = [2021]) -> Dict:
         """
-        모델 학습
+        모델 학습 (교차검증 + Validation 포함)
 
         Args:
             X: feature 데이터
@@ -201,6 +198,7 @@ class DirectionClassifierLGBM:
             test_size: 테스트 세트 비율
             use_cv: 교차검증 사용 여부
             cv_folds: 교차검증 fold 수
+            validation_years: validation용 데이터 연도 (기본값: [2021])
 
         Returns:
             학습 결과 메트릭
@@ -214,55 +212,127 @@ class DirectionClassifierLGBM:
 
         print(f"📊 Train set: {X_train.shape}, Test set: {X_test.shape}")
 
+        # Validation 데이터 로드 (2021년)
+        validation_metrics = None
+        if validation_years:
+            print(f"📊 Loading validation data for years: {validation_years}")
+            try:
+                X_val, y_val = self.load_data(
+                    market="KR",
+                    years=validation_years,
+                    max_tickers=100,
+                    feature_set="v2",
+                    label_horizon=1,
+                    label_thresh=0.05
+                )
+                print(f"📊 Validation set: {X_val.shape}")
+
+                # Validation 데이터에서 사용할 수 있는 feature만 선택
+                common_features = [f for f in self.feature_list if f in X_val.columns]
+                X_val = X_val[common_features]
+                X_train = X_train[common_features]
+                X_test = X_test[common_features]
+
+                print(f"📊 Using {len(common_features)} common features for validation")
+
+            except Exception as e:
+                print(f"⚠️ Warning: Could not load validation data: {e}")
+                X_val, y_val = None, None
+        else:
+            X_val, y_val = None, None
+
         # LightGBM 데이터셋 생성
         train_data = lgb.Dataset(X_train, label=y_train)
         test_data = lgb.Dataset(X_test, label=y_test, reference=train_data)
+
+        valid_sets = [train_data, test_data]
+        valid_names = ['train', 'valid']
+
+        if X_val is not None and y_val is not None:
+            val_data = lgb.Dataset(X_val, label=y_val, reference=train_data)
+            valid_sets.append(val_data)
+            valid_names.append('validation')
 
         # 모델 학습
         self.model = lgb.train(
             self.model_params,
             train_data,
-            valid_sets=[train_data, test_data],
-            valid_names=['train', 'valid'],
+            valid_sets=valid_sets,
+            valid_names=valid_names,
             callbacks=[
                 lgb.early_stopping(stopping_rounds=20),
                 lgb.log_evaluation(period=10)
             ]
         )
 
-        # 예측
-        y_pred_proba = self.model.predict(X_test)
-        y_pred = (y_pred_proba > 0.5).astype(int)
+        # Train/Test 예측 및 메트릭
+        y_pred_proba_test = self.model.predict(X_test)
+        y_pred_test = (y_pred_proba_test > 0.5).astype(int)
 
         # 메트릭 계산
         metrics = {
-            'accuracy': accuracy_score(y_test, y_pred),
-            'precision': precision_score(y_test, y_pred, zero_division=0),
-            'recall': recall_score(y_test, y_pred, zero_division=0),
-            'f1_score': f1_score(y_test, y_pred, zero_division=0),
-            'roc_auc': roc_auc_score(y_test, y_pred_proba)
+            'accuracy': accuracy_score(y_test, y_pred_test),
+            'precision': precision_score(y_test, y_pred_test, zero_division=0),
+            'recall': recall_score(y_test, y_pred_test, zero_division=0),
+            'f1_score': f1_score(y_test, y_pred_test, zero_division=0),
+            'roc_auc': roc_auc_score(y_test, y_pred_proba_test),
+            'confusion_matrix': confusion_matrix(y_test, y_pred_test),
+            'classification_report': classification_report(y_test, y_pred_test, zero_division=0)
         }
+
+        # Validation 평가 (2021년 데이터)
+        if X_val is not None and y_val is not None:
+            y_pred_proba_val = self.model.predict(X_val)
+            y_pred_val = (y_pred_proba_val > 0.5).astype(int)
+
+            validation_metrics = {
+                'val_accuracy': accuracy_score(y_val, y_pred_val),
+                'val_precision': precision_score(y_val, y_pred_val, zero_division=0),
+                'val_recall': recall_score(y_val, y_pred_val, zero_division=0),
+                'val_f1_score': f1_score(y_val, y_pred_val, zero_division=0),
+                'val_roc_auc': roc_auc_score(y_val, y_pred_proba_val),
+                'val_confusion_matrix': confusion_matrix(y_val, y_pred_val),
+                'val_classification_report': classification_report(y_val, y_pred_val, zero_division=0)
+            }
+
+            metrics.update(validation_metrics)
 
         # 교차검증 (옵션)
         if use_cv:
             cv_scores = cross_val_score(
                 lgb.LGBMClassifier(**self.model_params),
-                X, y, cv=cv_folds, scoring='accuracy'
+                X_train, y_train, cv=cv_folds, scoring='accuracy'
             )
             metrics['cv_accuracy_mean'] = cv_scores.mean()
             metrics['cv_accuracy_std'] = cv_scores.std()
 
         # Feature Importance 저장
         self.feature_importance = pd.DataFrame({
-            'feature': X.columns,
+            'feature': X_train.columns,
             'importance': self.model.feature_importance(importance_type='gain')
         }).sort_values('importance', ascending=False)
 
         self.training_metrics = metrics
 
         print("✅ Training completed!")
-        print(f"🎯 Test Accuracy: {metrics['accuracy']:.4f}")
-        print(f"🎯 Test ROC-AUC: {metrics['roc_auc']:.4f}")
+        print("\n📊 Test Performance:")
+        print(f"  🎯 Accuracy: {metrics['accuracy']:.4f}")
+        print(f"  🎯 ROC-AUC: {metrics['roc_auc']:.4f}")
+        print(f"  🎯 Precision: {metrics['precision']:.4f}")
+        print(f"  🎯 Recall: {metrics['recall']:.4f}")
+        print(f"  🎯 F1-Score: {metrics['f1_score']:.4f}")
+
+        if validation_metrics:
+            print("\n📊 Validation Performance (2021):")
+            print(f"  🎯 Accuracy: {validation_metrics['val_accuracy']:.4f}")
+            print(f"  🎯 ROC-AUC: {validation_metrics['val_roc_auc']:.4f}")
+            print(f"  🎯 Precision: {validation_metrics['val_precision']:.4f}")
+            print(f"  🎯 Recall: {validation_metrics['val_recall']:.4f}")
+            print(f"  🎯 F1-Score: {validation_metrics['val_f1_score']:.4f}")
+
+        if use_cv:
+            print("\n📊 Cross-Validation:")
+            print(f"  🎯 CV Accuracy: {metrics['cv_accuracy_mean']:.4f} ± {metrics['cv_accuracy_std']:.4f}")
 
         return metrics
 
@@ -402,36 +472,18 @@ class DirectionClassifierLGBM:
 
         print(f"📂 Model loaded from {filepath}")
 
-    def get_feature_correlation(self, X: pd.DataFrame, save_path: Optional[str] = None):
-        """Feature 간 상관관계 분석"""
-        corr_matrix = X.corr()
-
-        plt.figure(figsize=(14, 12))
-        mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
-        sns.heatmap(corr_matrix, mask=mask, annot=True, cmap='RdBu_r', center=0,
-                   square=True, linewidths=0.5, cbar_kws={"shrink": 0.8},
-                   fmt='.2f', annot_kws={'size': 8})
-        plt.title('Direction Classifier Features - Correlation Matrix', fontweight='bold')
-        plt.tight_layout()
-
-        if save_path:
-            plt.savefig(save_path, dpi=160, bbox_inches='tight')
-            print(f"💾 Correlation matrix saved to {save_path}")
-
-        plt.show()
-
-        return corr_matrix
-
 def create_direction_classifier_model(market: str = "KR",
                                     years: List[int] = [2018, 2019, 2020],
+                                    validation_years: Optional[List[int]] = [2021],
                                     save_model: bool = True,
                                     model_dir: str = "models/saved") -> DirectionClassifierLGBM:
     """
-    방향 분류 모델 생성 및 학습
+    방향 분류 모델 생성 및 학습 (교차검증 + Validation 포함)
 
     Args:
         market: 시장 코드
         years: 학습 연도
+        validation_years: validation용 데이터 연도 (기본값: [2021])
         save_model: 모델 저장 여부
         model_dir: 모델 저장 디렉토리
 
@@ -450,40 +502,24 @@ def create_direction_classifier_model(market: str = "KR",
     # 데이터 로드
     X, y = model.load_data(market=market, years=years)
 
-    # Feature 상관관계 확인
-    print("🔍 Checking feature correlations...")
-    corr_matrix = model.get_feature_correlation(X)
+    # 모델 학습 (교차검증 + Validation 포함)
+    metrics = model.train(X, y, validation_years=validation_years)
 
-    # 상관관계가 0.8 이상인 feature 쌍 출력
-    high_corr_pairs = []
-    for i in range(len(corr_matrix.columns)):
-        for j in range(i+1, len(corr_matrix.columns)):
-            if abs(corr_matrix.iloc[i, j]) >= 0.8:
-                high_corr_pairs.append((
-                    corr_matrix.columns[i],
-                    corr_matrix.columns[j],
-                    corr_matrix.iloc[i, j]
-                ))
+    # Classification Report 출력
+    print("\n📊 Detailed Classification Report (Test Set):")
+    print(metrics['classification_report'])
 
-    if high_corr_pairs:
-        print("⚠️ High correlation pairs (|corr| >= 0.8):")
-        for feat1, feat2, corr in high_corr_pairs:
-            print(f"  {feat1} - {feat2}: {corr:.3f}")
-        print()
-    else:
-        print("✅ No high correlation pairs found!")
-        print()
+    if 'val_classification_report' in metrics:
+        print("📊 Detailed Classification Report (Validation Set - 2021):")
+        print(metrics['val_classification_report'])
 
-    # 모델 학습
-    metrics = model.train(X, y)
+    # Confusion Matrix 출력
+    print("📊 Confusion Matrix (Test Set):")
+    print(metrics['confusion_matrix'])
 
-    # 결과 출력
-    print("📊 Model Performance:")
-    for metric, value in metrics.items():
-        if isinstance(value, float):
-            print(f"  {metric}: {value:.4f}")
-        else:
-            print(f"  {metric}: {value}")
+    if 'val_confusion_matrix' in metrics:
+        print("📊 Confusion Matrix (Validation Set - 2021):")
+        print(metrics['val_confusion_matrix'])
     print()
 
     # Feature Importance 출력
@@ -503,14 +539,23 @@ def create_direction_classifier_model(market: str = "KR",
     return model
 
 if __name__ == "__main__":
-    # 예시 실행
+    # 예시 실행 (교차검증 + 2021년 Validation)
     model = create_direction_classifier_model(
         market="KR",
         years=[2018, 2019, 2020],
+        validation_years=[2021],
         save_model=True
     )
 
     print("✅ Direction Classifier Model created successfully!")
     print(f"🎯 Features used: {len(SELECTED_FEATURES)}")
-    print(f"🏆 Best accuracy: {model.training_metrics.get('accuracy', 'N/A')}")
-    print(f"🏆 Best ROC-AUC: {model.training_metrics.get('roc_auc', 'N/A')}")
+    print(f"🏆 Test Accuracy: {model.training_metrics.get('accuracy', 'N/A')}")
+    print(f"🏆 Test ROC-AUC: {model.training_metrics.get('roc_auc', 'N/A')}")
+
+    if 'val_accuracy' in model.training_metrics:
+        print(f"🏆 Validation Accuracy (2021): {model.training_metrics.get('val_accuracy', 'N/A')}")
+        print(f"🏆 Validation ROC-AUC (2021): {model.training_metrics.get('val_roc_auc', 'N/A')}")
+
+    if 'cv_accuracy_mean' in model.training_metrics:
+        print(f"🏆 CV Accuracy: {model.training_metrics.get('cv_accuracy_mean', 'N/A'):.4f} ± {model.training_metrics.get('cv_accuracy_std', 'N/A'):.4f}")
+
