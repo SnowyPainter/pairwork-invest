@@ -75,7 +75,7 @@ def _make_build_cache_key(
     cache_invalidate_on: str,
 ) -> str:
     params = {
-        "v": "build_dataset_v1",
+        "v": "build_dataset_v2_normalized",  # 정규화 버전으로 업데이트
         "years": _stable_list(years),
         "market": market,
         "exchanges": _stable_list(exchanges),
@@ -179,6 +179,37 @@ def build_dataset(
     # 5. 라벨 추가
     lf = future_return_labels(lf, horizon=label_horizon, task=label_task, thresh=label_thresh)
     _quick_counts(lf, "labels", verbose)
+
+    # 6. 피처 정규화 (Z-Score) - 기본 컬럼 제외하고 모든 피처에 적용
+    if verbose:
+        print("[normalize] Applying Z-score normalization to features...")
+    
+    # 정규화할 컬럼 식별 (기본 컬럼과 라벨 컬럼 제외)
+    schema_names = lf.collect_schema().names()
+    base_cols = {"date","ticker","market","exchange","currency","year","open","high","low","close","adj_close","volume","turnover"}
+    
+    feature_cols = [c for c in schema_names 
+                   if c not in base_cols 
+                   and not c.startswith("label_") 
+                   and not c.startswith("futret_")
+                   and lf.collect_schema()[c] in (pl.Float32, pl.Float64, pl.Int32, pl.Int64, pl.UInt32, pl.UInt64)]
+    
+    if feature_cols:
+        # 각 피처별로 Z-score 정규화 (전체 데이터셋 기준)
+        normalize_exprs = []
+        for col in feature_cols:
+            x = pl.col(col)
+            z_score = (x - x.mean()) / (x.std() + 1e-9)  # eps 추가로 0으로 나누기 방지
+            normalize_exprs.append(z_score.alias(col))
+        
+        # 기존 컬럼들 + 정규화된 피처들
+        keep_cols = [c for c in schema_names if c not in feature_cols]
+        lf = lf.with_columns(normalize_exprs).select(keep_cols + feature_cols)
+        
+        if verbose:
+            print(f"[normalize] Applied Z-score to {len(feature_cols)} features")
+    
+    _quick_counts(lf, "normalized", verbose)
 
     # NaN 처리
     if drop_na_rows:
