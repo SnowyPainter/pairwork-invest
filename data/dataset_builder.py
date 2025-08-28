@@ -108,7 +108,7 @@ def build_dataset(
     feature_set: str = "v1",
     label_horizon: int = 5,
     label_task: str = "regression",   # or "classification"
-    label_thresh: float = 0.02,
+    label_thresh: float = 0.05,
     select_cols: Optional[Iterable[str]] = None,  # 최종 반환 컬럼 제한(선택)
     drop_na_rows: bool = True,
     verbose: bool = False,

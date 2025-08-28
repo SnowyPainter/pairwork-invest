@@ -142,8 +142,8 @@ def _select_universe(lf: pl.LazyFrame, uni: UniverseRule, signal_col: str) -> pl
 
 
 def _select_positions(lf: pl.LazyFrame, sig: SignalRule, signal_col: str) -> pl.LazyFrame:
-    # apply threshold
-    if sig.min_threshold is not None:
+    # apply threshold (skip if threshold is 0 or None)
+    if sig.min_threshold is not None and sig.min_threshold > 0:
         lf = lf.filter(pl.col(signal_col) >= sig.min_threshold)
 
     if sig.select_top_n is not None:
@@ -164,12 +164,10 @@ def _select_positions(lf: pl.LazyFrame, sig: SignalRule, signal_col: str) -> pl.
 
 def _assign_weights(lf: pl.LazyFrame, prt: PortfolioRule, signal_col: str) -> pl.LazyFrame:
     if prt.weighting == "equal":
-        w = (pl.lit(1.0)
-             .group_by("date").count()
-             .over("date")
+        # Count positions per date and calculate equal weights
+        return lf.with_columns(
+            weight = pl.col("side") / pl.len().over("date")
         )
-        # 1 / count  * side
-        return lf.with_columns(weight = (pl.col("side") / w))
 
     # score-proportional weights (positive-only scores assumed; if long/short, use |score|)
     denom = (pl.col(signal_col).abs() if True else pl.col(signal_col))
@@ -230,8 +228,13 @@ def backtest(df: pl.DataFrame, cfg: BacktestConfig) -> Dict[str, object]:
            .collect(streaming=True)
     )
 
+    # Add equity column first
     daily = daily.with_columns(
-        equity = (1.0 + pl.col("net_pnl")).cum_prod(),
+        equity = (1.0 + pl.col("net_pnl")).cum_prod()
+    )
+    
+    # Then add drawdown column
+    daily = daily.with_columns(
         dd = (pl.col("equity").cum_max() - pl.col("equity")) / pl.col("equity").cum_max()
     )
 

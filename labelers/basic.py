@@ -4,7 +4,7 @@ def future_return_labels(
     lf: pl.LazyFrame,
     horizon: int = 5,
     task: str = "regression",   # "regression" | "classification"
-    thresh: float = 0.02
+    thresh: float = 0.05
 ) -> pl.LazyFrame:
     g = "ticker"
     fut = pl.col("close").shift(-horizon).over(g)
