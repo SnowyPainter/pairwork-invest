@@ -175,7 +175,7 @@ def build_dataset(
         빌드된 데이터프레임
     """
     if verbose:
-        print(f"🚀 Building dataset: {market}, years={years}, normalize={normalize_features}")
+        print(f"Building dataset: {market}, years={years}, normalize={normalize_features}")
     
     # 1. 캐시 확인
     cache_path: Path | None = None

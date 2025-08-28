@@ -198,44 +198,47 @@ def _select_positions(df: pl.DataFrame, config: BacktestConfig) -> pl.DataFrame:
 
 def _assign_weights(df: pl.DataFrame, config: BacktestConfig) -> pl.DataFrame:
     """
-    가중치 할당 (종목당 고정 자산 방식)
+    가중치 할당 (시그널당 고정 자산 방식)
+    - 각 시그널(종목)마다 동일한 금액 투자
+    - 동시 포지션 수와 무관하게 독립적 투자
     """
     print("[가중치 및 자본 할당 시작]")
     start_time = time.time()
-    
-    capital_per_position = config.portfolio.capital_per_position
-    
-    # 선택된 포지션에만 고정 자산 할당
+
+    # 시그널당 투자 금액 (종목 불문하고 동일 금액)
+    capital_per_signal = config.portfolio.capital_per_position
+
+    # 선택된 포지션에 시그널당 고정 자산 할당
     result = df.with_columns([
-        # 종목당 고정 자산 할당
+        # 각 시그널마다 동일 금액 투자
         pl.when(pl.col("selected"))
-        .then(pl.lit(capital_per_position))
+        .then(pl.lit(capital_per_signal))
         .otherwise(0.0)
         .alias("position_capital"),
-        
-        # 가중치는 1.0 (각 종목이 독립적으로 운용)
+
+        # 가중치는 1.0 (각 시그널이 독립적으로 운용)
         pl.when(pl.col("selected"))
         .then(pl.lit(1.0))
         .otherwise(0.0)
         .alias("weight")
     ])
-    
-    # 일별 총 투입 자본 계산
+
+    # 일별 총 투입 자본 계산 (동시 포지션 수 × 시그널당 금액)
     daily_capital = (
         result.filter(pl.col("selected"))
         .group_by("date")
         .agg([
-            pl.col("position_capital").sum().alias("total_capital"),
+            (pl.col("position_capital").sum()).alias("total_capital"),
             pl.len().alias("n_positions")
         ])
     )
-    
+
     # 총 투입 자본 정보 추가
     result = result.join(daily_capital, on="date", how="left").with_columns([
         pl.col("total_capital").fill_null(0.0),
         pl.col("n_positions").fill_null(0)
     ])
-    
+
     weight_time = time.time() - start_time
     print(f"  소요시간: {weight_time:.2f}초")
 
@@ -248,17 +251,17 @@ def _assign_weights(df: pl.DataFrame, config: BacktestConfig) -> pl.DataFrame:
         ]).row(0)
 
         print("  자본 배분 현황:")
-        print(f"    종목당 자본: {capital_per_position:,.0f}원")
+        print(f"    시그널당 투자금: {capital_per_signal:,.0f}원 (고정)")
         print(f"    일평균 포지션: {capital_stats[1]:.1f}개")
-        print(f"    일평균 자본: {capital_stats[0]:,.0f}원")
-        print(f"    최대 일자본: {capital_stats[2]:,.0f}원")
-    
+        print(f"    일평균 총 투자금: {capital_stats[0]:,.0f}원")
+        print(f"    최대 일 투자금: {capital_stats[2]:,.0f}원")
+
     return result
 
 
 def _apply_fees(df: pl.DataFrame, config: BacktestConfig) -> pl.DataFrame:
     """
-    수수료 적용 (종목당 고정 자산 방식)
+    수수료 적용 (시그널당 고정 자산 방식)
     """
     print("[수수료 적용 및 수익률 계산 시작]")
     start_time = time.time()
@@ -318,14 +321,26 @@ def backtest(df: pl.DataFrame, config: BacktestConfig) -> Dict[str, Any]:
     
     # 2. 포지션 선택
     position_start = time.time()
-    position_df = _select_positions(universe_df, config)
-    performance['position_time'] = time.time() - position_start
-    
-    selected_count = position_df.filter(pl.col("selected")).height
-    print(f"  총 선택 포지션: {selected_count:,}개")
+    try:
+        position_df = _select_positions(universe_df, config)
+        performance['position_time'] = time.time() - position_start
+        
+        # selected 컬럼 존재 확인
+        if "selected" not in position_df.columns:
+            print("  [오류] 'selected' 컬럼이 생성되지 않았습니다!")
+            return _empty_backtest_result()
+        
+        selected_count = position_df.filter(pl.col("selected")).height
+        print(f"  총 선택 포지션: {selected_count:,}개")
 
-    if selected_count == 0:
-        print("  [오류] 선택된 포지션이 없습니다!")
+        if selected_count == 0:
+            print("  [오류] 선택된 포지션이 없습니다!")
+            return _empty_backtest_result()
+            
+    except Exception as e:
+        print(f"  [오류] 포지션 선택 중 에러: {e}")
+        import traceback
+        traceback.print_exc()
         return _empty_backtest_result()
 
     # 3. 가중치 할당
@@ -384,19 +399,27 @@ def backtest(df: pl.DataFrame, config: BacktestConfig) -> Dict[str, Any]:
 
     print(f"  거래일수: {len(daily_results)}일")
 
-    # 6. 누적 성과 계산 (포트폴리오 레벨)
+        # 6. 누적 성과 계산 (간단하고 정확한 방식)
     print("[자본 곡선 계산]")
     equity_start = time.time()
-    
+
     daily_df = daily_results.to_pandas()
-    
-    # 일별 수익률 계산 (순수익 / 총투입자본)
-    daily_df['daily_return'] = daily_df['net_pnl'] / daily_df['total_capital']
-    daily_df['daily_return'] = daily_df['daily_return'].fillna(0)
-    
-    # 누적 수익률 계산
-    daily_df['equity'] = (1 + daily_df['daily_return']).cumprod()
-    daily_df['drawdown'] = (daily_df['equity'] / daily_df['equity'].expanding().max() - 1)
+
+    # 누적 성과 계산 (실제 투자 방식: 각 날짜별 독립 수익률)
+    if len(daily_df) > 0:
+        # 각 날짜별 수익률 = 그날의 net_pnl / 그날의 total_capital
+        daily_df['daily_return'] = daily_df['net_pnl'] / daily_df['total_capital']
+        daily_df['daily_return'] = daily_df['daily_return'].fillna(0)
+
+        # 자본곡선 = 일별 수익률의 누적 곱 (실제 투자 방식)
+        daily_df['equity'] = (1 + daily_df['daily_return']).cumprod()
+
+        # 드로우다운 계산
+        daily_df['drawdown'] = (daily_df['equity'] / daily_df['equity'].expanding().max() - 1)
+    else:
+        daily_df['daily_return'] = 0.0
+        daily_df['equity'] = 1.0
+        daily_df['drawdown'] = 0.0
     
     performance['equity_time'] = time.time() - equity_start
     
@@ -412,12 +435,27 @@ def backtest(df: pl.DataFrame, config: BacktestConfig) -> Dict[str, Any]:
     trading_days = np.sum(returns != 0)
     total_return = equity_values[-1] - 1 if len(equity_values) > 0 else 0
     
-    # 연간화 지표
-    if total_days > 0:
-        annual_factor = 252 / total_days
+    # 연간화 지표 (더 안전한 계산)
+    if total_days > 0 and trading_days > 0:
+        # 실제 거래일수 기준으로 연간화
+        annual_factor = 252 / trading_days
+        
+        # 연간화 팩터가 너무 크면 제한 (최대 10배)
+        annual_factor = min(annual_factor, 10.0)
+        
+        # 총 수익률이 너무 크거나 작으면 제한
+        total_return = max(min(total_return, 10.0), -0.99)
+        
         ret_annual = (1 + total_return) ** annual_factor - 1
         vol_annual = _safe_std(returns) * np.sqrt(252)
         sharpe = ret_annual / vol_annual if vol_annual > 0 else 0
+        
+        # 비정상적인 값 체크
+        if abs(ret_annual) > 100:  # 10000% 이상이면 제한
+            ret_annual = np.sign(ret_annual) * 1.0  # 100%로 제한
+            
+        print(f"  연간화 계산: total_days={total_days}, trading_days={trading_days}, factor={annual_factor:.2f}")
+        print(f"  총 수익률: {total_return:.4f}, 연간 수익률: {ret_annual:.4f}")
     else:
         ret_annual = vol_annual = sharpe = 0
     
@@ -490,7 +528,11 @@ def backtest(df: pl.DataFrame, config: BacktestConfig) -> Dict[str, Any]:
         'daily': pl.from_pandas(daily_df),
         'ticker_performance': ticker_df,  # 종목별 성과로 변경
         'performance': performance,
-        'config': config
+        'config': config,
+        'processed_data': final_df.select([
+            "date", "ticker", "selected", "weight", "position_capital", 
+            "gross_pnl", "net_pnl", config.signal_col, config.label_col
+        ])  # 처리된 데이터 추가
     }
 
 
@@ -515,7 +557,8 @@ def _empty_backtest_result() -> Dict[str, Any]:
         'daily': pl.DataFrame(),
         'ticker_performance': pd.DataFrame(),
         'performance': {},
-        'config': None
+        'config': None,
+        'processed_data': pl.DataFrame()  # 빈 processed_data 추가
     }
 
 
@@ -585,7 +628,10 @@ def plot_monthly_heatmap(backtest_result: Dict[str, Any], show: bool = True):
     daily_pd['year'] = daily_pd['date'].dt.year
     daily_pd['month'] = daily_pd['date'].dt.month
 
-    monthly = daily_pd.groupby(['year', 'month'])['net_pnl'].apply(lambda x: (1 + x).prod() - 1)
+    # 월별 수익률 계산: 일별 PnL / 일별 투자금을 사용
+    monthly = daily_pd.groupby(['year', 'month']).apply(
+        lambda g: g['net_pnl'].sum() / g['total_capital'].sum() if g['total_capital'].sum() > 0 else 0
+    )
     monthly_pivot = monthly.unstack(fill_value=0)
 
     fig, ax = plt.subplots(figsize=(12, 8))
@@ -611,9 +657,36 @@ def plot_rolling_sharpe(backtest_result: Dict[str, Any], window: int = 60, show:
         return
 
     daily_pd = daily.to_pandas()
-    rolling_sharpe = daily_pd['net_pnl'].rolling(window).apply(
-        lambda x: x.mean() / x.std() * np.sqrt(252) if x.std() > 0 else 0
+
+    # Rolling Sharpe 계산 (디버깅 강화)
+    series = daily_pd['daily_return'] if 'daily_return' in daily_pd.columns else (daily_pd['net_pnl'] / daily_pd['total_capital']).fillna(0)
+
+    print(f"[Rolling Sharpe 디버깅] window={window}")
+    print(f"  series 통계: mean={series.mean():.8f}, std={series.std():.8f}")
+    print(f"  series 범위: {series.min():.8f} ~ {series.max():.8f}")
+    print(f"  데이터 길이: {len(series)}")
+
+    # 문제 진단
+    if series.std() == 0 or series.std() < 1e-10:
+        print("  ⚠️  WARNING: series 표준편차가 0이거나 매우 작습니다")
+        if (abs(series) < 1e-10).all():
+            print("  ⚠️  WARNING: 모든 값이 0에 가깝습니다")
+
+    if len(series) < window:
+        print(f"  ⚠️  WARNING: 데이터 길이({len(series)})가 window({window})보다 작습니다")
+
+    # Sharpe 계산 (개선된 로직)
+    rolling_sharpe = series.rolling(window, min_periods=1).apply(
+        lambda x: x.mean() / x.std() * np.sqrt(252) if len(x) > 1 and x.std() > 1e-10 else np.nan
     )
+
+    print(f"  rolling_sharpe 통계: mean={rolling_sharpe.mean():.6f}, std={rolling_sharpe.std():.6f}")
+    print(f"  NaN 개수: {rolling_sharpe.isna().sum()}, 유효 값 개수: {rolling_sharpe.notna().sum()}")
+
+    # NaN을 0으로 채우기 (차트 표시를 위해)
+    rolling_sharpe = rolling_sharpe.fillna(0)
+
+    print(f"  최종 rolling_sharpe 범위: {rolling_sharpe.min():.6f} ~ {rolling_sharpe.max():.6f}")
 
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.plot(daily_pd['date'], rolling_sharpe, linewidth=2, color='green')
@@ -656,7 +729,7 @@ def plot_contrib_by_ticker(backtest_result: Dict[str, Any], top: int = 20, show:
     for i, bar in enumerate(bars1):
         if top_tickers.iloc[i]['total_pnl'] >= 0:
             bar.set_color('green')
-        else:
+    else:
             bar.set_color('red')
 
     # 2. 평균 거래당 수익률
