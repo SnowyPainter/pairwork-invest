@@ -37,7 +37,15 @@ def scan_ohlcv(
     if market:
         lf = lf.filter(pl.col("market") == market)
         applied_scan_filters.append(f"market={market}")
-
+    if tickers:
+        lf = lf.filter(pl.col("ticker").is_in(tickers))
+        applied_scan_filters.append(f"tickers={len(tickers)}개")
+    if years:
+        lf = lf.filter(pl.col("year").is_in(years))
+        applied_scan_filters.append(f"years={years}")
+    if exchanges:
+        lf = lf.filter(pl.col("exchange").is_in(exchanges))
+        applied_scan_filters.append(f"exchanges={exchanges}")
     if applied_scan_filters:
         print(f"[scan] 기본 필터 적용: {applied_scan_filters}")
 
@@ -55,6 +63,8 @@ def filter_ohlcv(
     end: Optional[date] = None,
     scan_market: Optional[Market] = None,
     scan_years: Optional[Iterable[int]] = None,
+    *,
+    sort_result: bool = True,
 ) -> pl.LazyFrame:
     """
     최적화된 필터링: scan 단계에서 적용된 필터는 건너뜀
@@ -99,7 +109,7 @@ def filter_ohlcv(
     if applied_filters:
         print(f"[filter] 적용된 필터: {', '.join(applied_filters)}")
 
-    return lf.sort(["ticker","date"])
+    return lf.sort(["ticker","date"]) if sort_result else lf
 
 def sample_tickers(
     lf: pl.LazyFrame, max_tickers: Optional[int] = None, seed: int = 42
@@ -110,19 +120,16 @@ def sample_tickers(
     if max_tickers is None:
         return lf
 
-    # 현재 티커 수 확인 (streaming으로 메모리 효율적)
-    current_count = lf.select(pl.n_unique("ticker")).collect(streaming=True)[0, 0]
+    # 단일 패스로 고유 티커 추출 후 샘플링 결정
+    import random
+    random.seed(seed)
 
+    all_tickers = lf.select("ticker").unique().collect(streaming=False)["ticker"].to_list()
+    current_count = len(all_tickers)
     if current_count <= max_tickers:
         print(f"[sample] 티커 수 {current_count}개 <= {max_tickers}개, 샘플링 생략")
         return lf
 
-    # 샘플링할 티커 선택
-    import random
-    random.seed(seed)
-
-    # 메모리 효율을 위해 배치로 처리
-    all_tickers = lf.select("ticker").unique().collect(streaming=True)["ticker"].to_list()
     sampled_tickers = random.sample(all_tickers, max_tickers)
 
     print(f"[sample] 티커 샘플링: {current_count}개 -> {max_tickers}개")
