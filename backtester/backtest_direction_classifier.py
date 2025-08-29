@@ -32,7 +32,7 @@ from data.dataset_builder import build_dataset
 from backtester.backtester import (
     BacktestConfig, UniverseRule, SignalRule, ExecutionRule, PortfolioRule,
     backtest, plot_equity, plot_drawdown, plot_monthly_heatmap,
-    plot_rolling_sharpe, plot_contrib_by_ticker, quick_run
+    plot_rolling_sharpe, plot_contrib_by_ticker, plot_signals_per_ticker, quick_run
 )
 
 
@@ -169,19 +169,23 @@ def create_simple_signals(model: DirectionClassifierLGBM, df: pl.DataFrame) -> p
         print(f"  > 0.6: {np.sum(signals > 0.6):,} ({np.mean(signals > 0.6)*100:.1f}%)")
         print(f"  > 0.7: {np.sum(signals > 0.7):,} ({np.mean(signals > 0.7)*100:.1f}%)")
         
-        # 7. 이벤트 데이터에 신호 추가
-        event_df_with_signal = event_df.with_columns(
-            signal_direction=pl.Series("signal_direction", signals, dtype=pl.Float64)
-        )
+        # 7. 이벤트 데이터에 신호 추가 (차트용 확률값도 포함)
+        event_df_with_signal = event_df.with_columns([
+            pl.Series("signal_direction", signals, dtype=pl.Float64).alias("signal_direction"),
+            pl.Series("signal_trigger_prob", signals, dtype=pl.Float64).alias("signal_trigger_prob"),  # direction 확률
+            pl.Series("signal_event_prob", signals, dtype=pl.Float64).alias("signal_event_prob"),      # event 확률 (direction과 동일)
+        ])
         
         # 8. 전체 데이터에 병합
         result_df = df.join(
-            event_df_with_signal.select(["date", "ticker", "signal_direction"]),
+            event_df_with_signal.select(["date", "ticker", "signal_direction", "signal_trigger_prob", "signal_event_prob"]),
             on=["date", "ticker"],
             how="left"
-        ).with_columns(
-            signal_direction=pl.col("signal_direction").fill_null(0.0)
-        )
+        ).with_columns([
+            pl.col("signal_direction").fill_null(0.0).alias("signal_direction"),
+            pl.col("signal_trigger_prob").fill_null(0.0).alias("signal_trigger_prob"),
+            pl.col("signal_event_prob").fill_null(0.0).alias("signal_event_prob"),
+        ])
         
         signal_time = time.time() - start_time
         print(f"✅ Signals created in {signal_time:.2f} seconds")
@@ -267,7 +271,7 @@ def run_simple_backtest(market: str = "KR",
         ),
         signal=SignalRule(
             select_top_n=top_positions,
-            min_threshold=0.1,  # 매우 낮은 임계값 (10%)
+            min_threshold=min_threshold,  # 매우 낮은 임계값 (10%)
             long_only=True
         ),
         execution=ExecutionRule(mode="next_open_to_close"),
@@ -320,6 +324,8 @@ def run_simple_backtest(market: str = "KR",
         plot_monthly_heatmap(result, show=False)
         plot_rolling_sharpe(result, show=False)
         plot_contrib_by_ticker(result, show=False)
+        # 종목별 시그널 디버깅 차트
+        plot_signals_per_ticker(result, show=False)
         
         total_time = time.time() - start_time
         print(f"\n🏁 Total execution time: {total_time:.2f} seconds")
@@ -343,7 +349,7 @@ def main():
     MARKET = "KR"
     TRAIN_YEARS = [2018, 2019, 2020]
     TEST_YEARS = [2021]
-    MAX_TICKERS = 50      # 더 작게
+    MAX_TICKERS = 30      # 더 작게
     TOP_POSITIONS = 10    # 더 작게
     MIN_THRESHOLD = 0.5   # 적당한 임계값
     

@@ -436,7 +436,8 @@ class DirectionClassifierLGBM:
         # LightGBM 모델 저장
         self.model.save_model(filepath)
 
-        # 메타데이터 저장
+        # 메타데이터 저장 (JSON으로 안전하게 저장)
+        import json
         metadata = {
             'feature_list': self.feature_list,
             'model_params': self.model_params,
@@ -444,12 +445,21 @@ class DirectionClassifierLGBM:
             'training_metrics': self.training_metrics
         }
 
-        metadata_path = filepath.replace('.txt', '_metadata.pkl')
-        with open(metadata_path, 'wb') as f:
-            pickle.dump(metadata, f)
+        # JSON으로 메타데이터 저장 (pickle 문제 회피)
+        json_metadata_path = filepath.replace('.txt', '_metadata.json')
+        with open(json_metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2, default=str)
+
+        # 기존 pickle 방식도 유지 (호환성)
+        try:
+            pickle_metadata_path = filepath.replace('.txt', '_metadata.pkl')
+            with open(pickle_metadata_path, 'wb') as f:
+                pickle.dump(metadata, f)
+        except Exception as e:
+            print(f"  [경고] Pickle 저장 실패 (JSON으로 저장됨): {e}")
 
         print(f"💾 Model saved to {filepath}")
-        print(f"💾 Metadata saved to {metadata_path}")
+        print(f"💾 Metadata saved to {json_metadata_path}")
 
     def load_model(self, filepath: str):
         """모델 로드"""
@@ -459,16 +469,39 @@ class DirectionClassifierLGBM:
         # LightGBM 모델 로드
         self.model = lgb.Booster(model_file=filepath)
 
-        # 메타데이터 로드
-        metadata_path = filepath.replace('.txt', '_metadata.pkl')
-        if os.path.exists(metadata_path):
-            with open(metadata_path, 'rb') as f:
-                metadata = pickle.load(f)
+        # 메타데이터 로드 (JSON 우선, pickle fallback)
+        import json
+        metadata = None
 
+        # 1. JSON 파일 시도 (안전한 방식)
+        json_metadata_path = filepath.replace('.txt', '_metadata.json')
+        if os.path.exists(json_metadata_path):
+            try:
+                with open(json_metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                print(f"  ✅ JSON 메타데이터 로드 성공")
+            except Exception as e:
+                print(f"  [경고] JSON 메타데이터 로드 실패: {e}")
+
+        # 2. Pickle 파일 시도 (기존 호환성)
+        if metadata is None:
+            pickle_metadata_path = filepath.replace('.txt', '_metadata.pkl')
+            if os.path.exists(pickle_metadata_path):
+                try:
+                    with open(pickle_metadata_path, 'rb') as f:
+                        metadata = pickle.load(f)
+                    print(f"  ✅ Pickle 메타데이터 로드 성공")
+                except Exception as e:
+                    print(f"  [경고] Pickle 메타데이터 로드 실패: {e}")
+
+        # 3. 메타데이터가 있으면 적용
+        if metadata is not None:
             self.feature_list = metadata.get('feature_list', [])
             self.model_params = metadata.get('model_params', {})
             self.feature_importance = pd.DataFrame(metadata.get('feature_importance', {}))
             self.training_metrics = metadata.get('training_metrics', {})
+        else:
+            print(f"  [경고] 메타데이터 파일이 없어 기본값 사용")
 
         print(f"📂 Model loaded from {filepath}")
 

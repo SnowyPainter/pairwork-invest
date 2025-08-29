@@ -143,6 +143,9 @@ def add_v2_features(lf: pl.LazyFrame) -> pl.LazyFrame:
         .with_columns([
             pl.col("stochk14").rolling_mean(3).over(g).fill_null(pl.col("stochk14")).alias("stochd14")
         ])
+        .with_columns([
+            (pl.col("stochk14") - pl.col("stochd14")).alias("stoch_spread")
+        ])
         # 5) Williams %R (null 대체 적용)
         .with_columns([
             (-_safe_div(pl.col("highest14") - pl.col("close"), pl.col("highest14") - pl.col("lowest14")) * 100).alias("willr14_raw"),

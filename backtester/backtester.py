@@ -45,6 +45,10 @@ class SignalRule:
 class ExecutionRule:
     """실행 규칙"""
     mode: str = "next_open_to_close"
+    # next_open_to_close_tp: 다음날 시가 매수 후 intraday 목표수익 달성 시 청산
+    take_profit_pct: float = 0.0  # 예: 0.03 → +3% 도달 시 당일 청산
+    # next_open_to_close_nmove: 다음날 시가 대비 절대 변동률이 n% 이상이면 청산(상/하락 모두)
+    move_exit_pct: float = 0.0
 
 
 @dataclass
@@ -152,7 +156,7 @@ def _select_positions(df: pl.DataFrame, config: BacktestConfig) -> pl.DataFrame:
 
     # 1. 신호 임계값 필터링
     positions = df.filter(
-        (pl.col(config.signal_col) >= config.signal.min_threshold) &
+        (pl.col(config.signal_col) > config.signal.min_threshold) &
         (~pl.col(config.signal_col).is_null())
     )
 
@@ -268,20 +272,104 @@ def _apply_fees(df: pl.DataFrame, config: BacktestConfig) -> pl.DataFrame:
     
     # 수수료율 계산
     fee_rate = (config.portfolio.fee_bps + config.portfolio.slippage_bps) / 10000.0
-    
-    result = df.with_columns([
-        # 종목별 총 수익/손실 (자산 * 수익률)
-        (pl.col("position_capital") * pl.col(config.label_col)).alias("gross_pnl"),
-        
-        # 종목별 수수료 (자산 * 수수료율)
-        (pl.col("position_capital") * fee_rate).alias("fee_cost"),
-        
-        # 종목별 순 수익/손실 (총수익 - 수수료)
-        (pl.col("position_capital") * pl.col(config.label_col) - pl.col("position_capital") * fee_rate).alias("net_pnl"),
-        
-        # 종목별 수익률 (순수익 / 투입자본)
-        ((pl.col("position_capital") * pl.col(config.label_col) - pl.col("position_capital") * fee_rate) / pl.col("position_capital")).alias("net_return")
-    ])
+
+    # 수익률 산출 모드 결정
+    use_tp_mode = (
+        hasattr(config, "execution")
+        and config.execution is not None
+        and config.execution.mode == "next_open_to_close_tp"
+        and config.execution.take_profit_pct is not None
+        and config.execution.take_profit_pct > 0
+    )
+    use_nmove_mode = (
+        hasattr(config, "execution")
+        and config.execution is not None
+        and config.execution.mode in ("next_open_to_close_nmove", "next_open_nmove")
+        and ((config.execution.move_exit_pct is not None and config.execution.move_exit_pct > 0) or (config.execution.take_profit_pct is not None and config.execution.take_profit_pct > 0))
+    )
+
+    if use_tp_mode or use_nmove_mode:
+        # 임계값: TP 모드면 take_profit_pct, nmove 모드면 move_exit_pct 우선 (fallback to take_profit_pct)
+        th = None
+        if use_tp_mode:
+            th = float(config.execution.take_profit_pct)
+        else:
+            th = float(config.execution.move_exit_pct or config.execution.take_profit_pct)
+
+        # 다음날 OHLC 준비 (티커 단위 시프트)
+        df = df.sort(["ticker", "date"]).with_columns([
+            pl.col("open").shift(-1).over("ticker").alias("open_next"),
+            pl.col("high").shift(-1).over("ticker").alias("high_next"),
+            pl.col("low").shift(-1).over("ticker").alias("low_next"),
+            pl.col("close").shift(-1).over("ticker").alias("close_next"),
+        ])
+
+        if use_tp_mode:
+            # TP 충족 여부 및 실현 수익률 계산 (롱 기준, 상승만)
+            df = df.with_columns([
+                (pl.col("open_next") * (1 + th)).alias("tp_price"),
+                (pl.col("high_next") >= pl.col("tp_price")).alias("hit_up"),
+                pl.lit(False).alias("hit_down"),
+                pl.lit(False).alias("both_hit"),
+                pl.when(pl.col("selected") & pl.col("open_next").is_not_null())
+                .then(
+                    pl.when(pl.col("hit_up")).then(pl.lit(th))
+                    .otherwise((pl.col("close_next") / pl.col("open_next") - 1.0))
+                )
+                .otherwise(0.0)
+                .alias("realized_return")
+            ])
+        else:
+            # 절대 변동 n% 이상 시 청산 (상/하락 모두)
+            df = df.with_columns([
+                (pl.col("open_next") * (1 + th)).alias("tp_price"),
+                (pl.col("open_next") * (1 - th)).alias("sl_price"),
+            ]).with_columns([
+                (pl.col("high_next") >= pl.col("tp_price")).alias("hit_up"),
+                (pl.col("low_next") <= pl.col("sl_price")).alias("hit_down"),
+            ]).with_columns([
+                (pl.col("hit_up") & pl.col("hit_down")).alias("both_hit")
+            ]).with_columns([
+                pl.when(pl.col("selected") & pl.col("open_next").is_not_null())
+                .then(
+                    pl.when(pl.col("hit_up") & ~pl.col("hit_down")).then(pl.lit(th))
+                    .when(pl.col("hit_down") & ~pl.col("hit_up")).then(pl.lit(-th))
+                    # 동시 터치 시 보수적으로 손절 우선으로 처리하려면 아래 줄을 바꾸세요
+                    .when(pl.col("both_hit")).then(pl.lit(-th))
+                    .otherwise((pl.col("close_next") / pl.col("open_next") - 1.0))
+                )
+                .otherwise(0.0)
+                .alias("realized_return")
+            ])
+
+        result = df.with_columns([
+            # 종목별 총 수익/손실 (자산 * 실현 수익률)
+            (pl.col("position_capital") * pl.col("realized_return")).alias("gross_pnl"),
+
+            # 종목별 수수료 (자산 * 수수료율)
+            (pl.col("position_capital") * fee_rate).alias("fee_cost"),
+
+            # 종목별 순 수익/손실 (총수익 - 수수료)
+            (pl.col("position_capital") * pl.col("realized_return") - pl.col("position_capital") * fee_rate).alias("net_pnl"),
+
+            # 종목별 수익률 (순수익 / 투입자본)
+            ((pl.col("position_capital") * pl.col("realized_return") - pl.col("position_capital") * fee_rate) / pl.col("position_capital")).alias("net_return")
+        ])
+    else:
+        # 라벨 기반 (예: futret_1 = next_open_to_close)
+        result = df.with_columns([
+            # 종목별 총 수익/손실 (자산 * 수익률)
+            (pl.col("position_capital") * pl.col(config.label_col)).alias("gross_pnl"),
+            
+            # 종목별 수수료 (자산 * 수수료율)
+            (pl.col("position_capital") * fee_rate).alias("fee_cost"),
+            
+            # 종목별 순 수익/손실 (총수익 - 수수료)
+            (pl.col("position_capital") * pl.col(config.label_col) - pl.col("position_capital") * fee_rate).alias("net_pnl"),
+            
+            # 종목별 수익률 (순수익 / 투입자본)
+            ((pl.col("position_capital") * pl.col(config.label_col) - pl.col("position_capital") * fee_rate) / pl.col("position_capital")).alias("net_return")
+        ])
     
     fee_time = time.time() - start_time
     print(f"  소요시간: {fee_time:.2f}초")
@@ -530,7 +618,15 @@ def backtest(df: pl.DataFrame, config: BacktestConfig) -> Dict[str, Any]:
         'performance': performance,
         'config': config,
         'processed_data': final_df.select([
-            "date", "ticker", "selected", "weight", "position_capital", 
+            # 기본 키/상태
+            "date", "ticker", "selected", "weight", "position_capital",
+            # 가격/거래 관련
+            "open", "high", "low", "close", "turnover",
+            # 다음날 참고 (TP/변동률 모드일 때 생성됨) - 안전하게 처리
+            *([col for col in ["open_next", "high_next", "low_next", "close_next", "tp_price", "hit_up", "hit_down", "both_hit", "realized_return"] if col in final_df.columns]),
+            # 신호 관련 확률값들 (안전하게 처리)
+            *([col for col in ["signal_trigger_prob", "signal_event_prob"] if col in final_df.columns]),
+            # 성과/신호
             "gross_pnl", "net_pnl", config.signal_col, config.label_col
         ])  # 처리된 데이터 추가
     }
@@ -729,7 +825,7 @@ def plot_contrib_by_ticker(backtest_result: Dict[str, Any], top: int = 20, show:
     for i, bar in enumerate(bars1):
         if top_tickers.iloc[i]['total_pnl'] >= 0:
             bar.set_color('green')
-    else:
+        else:
             bar.set_color('red')
 
     # 2. 평균 거래당 수익률
@@ -757,6 +853,106 @@ def plot_contrib_by_ticker(backtest_result: Dict[str, Any], top: int = 20, show:
         plt.show()
     else:
         plt.close()
+
+
+def plot_signals_per_ticker(backtest_result: Dict[str, Any], show: bool = False, max_tickers: int | None = None):
+    """종목별 차트 + 시그널 지점 표시 (디버깅용)
+    - close 라인 + 시그널 발생일 점 표시
+    - TP 모드인 경우, 다음날 TP 가격 라인 보조 표시
+    """
+    processed = backtest_result.get('processed_data', pl.DataFrame())
+    if len(processed) == 0:
+        print("[경고] 시그널 차트를 위한 processed_data가 없습니다")
+        return
+
+    df = processed.to_pandas().sort_values(['ticker', 'date'])
+
+    # 출력 디렉토리
+    config = backtest_result.get('config')
+    outdir = None
+    if config and config.outdir:
+        outdir = config.outdir / 'charts_by_ticker'
+        outdir.mkdir(parents=True, exist_ok=True)
+
+    # 티커 순회 (선택된 신호가 존재하는 티커만)
+    tickers = df.loc[df['selected'] == True, 'ticker'].unique().tolist()
+    if max_tickers is not None:
+        tickers = tickers[:max_tickers]
+
+    is_tp_mode = False
+    tp = 0.0
+    if config and config.execution and config.execution.mode == 'next_open_to_close_tp' and config.execution.take_profit_pct and config.execution.take_profit_pct > 0:
+        is_tp_mode = True
+        tp = float(config.execution.take_profit_pct)
+
+    for ticker in tickers:
+        sub = df[df['ticker'] == ticker].copy()
+        if sub.empty:
+            continue
+
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.plot(sub['date'], sub['close'], linewidth=1.5, color='black', label='Close')
+
+        sig = sub[sub['selected'] == True]
+        if not sig.empty:
+            # 수익 방향에 따라 색상 구분
+            if 'realized_return' in sig.columns and not sig['realized_return'].isna().all():
+                pos = sig[sig['realized_return'] >= 0]
+                neg = sig[sig['realized_return'] < 0]
+                if not pos.empty:
+                    ax.scatter(pos['date'], pos['close'], color='green', s=28, label='Signal (↑ or TP)')
+                    # direction_proba와 event_proba 값 표시
+                    for _, row in pos.iterrows():
+                        dir_prob = row.get('signal_trigger_prob', '')
+                        ev_prob = row.get('signal_event_prob', '')
+                        ax.annotate(f"D:{dir_prob:.2f}\nE:{ev_prob:.2f}", 
+                                  (row['date'], row['close']), 
+                                  xytext=(5, 5), textcoords='offset points', 
+                                  fontsize=7, color='green')
+                if not neg.empty:
+                    ax.scatter(neg['date'], neg['close'], color='orange', s=28, label='Signal (↓)')
+                    # direction_proba와 event_proba 값 표시
+                    for _, row in neg.iterrows():
+                        dir_prob = row.get('signal_trigger_prob', '')
+                        ev_prob = row.get('signal_event_prob', '')
+                        ax.annotate(f"D:{dir_prob:.2f}\nE:{ev_prob:.2f}", 
+                                  (row['date'], row['close']), 
+                                  xytext=(5, -15), textcoords='offset points', 
+                                  fontsize=7, color='orange')
+            else:
+                ax.scatter(sig['date'], sig['close'], color='red', s=25, label='Signal Day')
+                # direction_proba와 event_proba 값 표시
+                for _, row in sig.iterrows():
+                    dir_prob = row.get('signal_trigger_prob', '')
+                    ev_prob = row.get('signal_event_prob', '')
+                    ax.annotate(f"D:{dir_prob:.2f}\nE:{ev_prob:.2f}", 
+                              (row['date'], row['close']), 
+                              xytext=(5, 5), textcoords='offset points', 
+                              fontsize=7, color='red')
+
+        if is_tp_mode and 'open_next' in sub.columns and 'tp_price' in sub.columns:
+            # 다음날 TP 레벨 보조 표기 (선택적인 참고용)
+            next_day = sub.dropna(subset=['open_next', 'tp_price']).copy()
+            if not next_day.empty:
+                # 신호 발생일의 다음날에 TP 라인 표시를 위해 x축을 다음날로 쉬프트한 보조 시리즈 생성
+                # 단순화를 위해 다음날 date를 계산하지 않고, 참고용 라인만 표시
+                pass  # 세부 표시는 생략 (복잡도 대비 효용 낮음)
+
+        ax.set_title(f"{ticker} - Price with Signals", fontsize=12, fontweight='bold')
+        ax.set_xlabel('Date')
+        ax.set_ylabel('Price')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        if outdir is not None:
+            fp = outdir / f"{ticker}.png"
+            plt.savefig(fp, dpi=200, bbox_inches='tight')
+            print(f"[저장] 시그널 차트: {fp}")
+
+        if show:
+            plt.show()
+        else:
+            plt.close()
 
 
 def quick_run(df: pl.DataFrame, signal_col: str, label_col: str = "futret_1", 
