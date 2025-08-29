@@ -4,6 +4,12 @@
 
 다중공선성 문제를 고려하여 선별된 feature들을 사용하여
 상승/하락 방향을 예측하는 모델입니다.
+
+일단, 전체 주식 데이터에 대해서 한다. (약 3000개)
+이때, 전날 turnover 순위에 따라서 가중치를 부여한다.
+어차피 입력은 EventDetector 모델에서 예측한 급등락 예정된 주식들만 오기 때문에, 다음날 이벤트가 발생하는 row에 대해서만 학습한다.
+고로 딱히 시계열 입력이 필요없으니까 LGBM으로 진행한다.
+
 """
 
 import os
@@ -67,6 +73,9 @@ SELECTED_FEATURES = [
 
     # VWAP 그룹 (vwap20 선택 - 더 긴 기간)
     'vwap20'
+
+    # 전날 turnover 순위
+    "turnover_rank_prev1","turnover_ratio_1d","is_top100_prev1","is_top300_prev1"
 ]
 
 class DirectionClassifierLGBM:
@@ -90,6 +99,31 @@ class DirectionClassifierLGBM:
         self.model = None
         self.feature_importance = None
         self.training_metrics = {}
+
+    def add_prevday_turnover_feats(self, df: pl.DataFrame) -> pl.DataFrame:
+        return (
+            df.with_columns([
+                pl.col("turnover").rank("dense", descending=True).over("date").alias("turnover_rank_today"),
+                (pl.col("turnover") / pl.col("turnover").shift(1).over("ticker")).alias("turnover_ratio_1d"),
+            ])
+            .with_columns([
+                pl.col("turnover_rank_today").shift(1).over("ticker").alias("turnover_rank_prev1"),
+            ])
+            .with_columns([
+                (pl.col("turnover_rank_prev1") <= 100).cast(pl.Int8).alias("is_top100_prev1"),
+                (pl.col("turnover_rank_prev1") <= 300).cast(pl.Int8).alias("is_top300_prev1"),
+            ])
+        )
+
+    def make_sample_weight(self,df: pl.DataFrame, w_top=3.0, w_mid=1.5, w_base=1.0) -> np.ndarray:
+        # Top100 표본에 더 큰 가중치, 그다음 Top300, 이외는 기본
+        w = np.full(df.height, w_base, dtype=np.float32)
+        if "is_top300_prev1" in df.columns:
+            w[df["is_top300_prev1"].to_numpy()==1] = w_mid
+        if "is_top100_prev1" in df.columns:
+            idx = (df["is_top100_prev1"].to_numpy()==1)
+            w[idx] = w_top
+        return w
 
     def _get_default_params(self) -> Dict:
         """기본 LightGBM 파라미터"""
@@ -117,7 +151,8 @@ class DirectionClassifierLGBM:
                   max_tickers: int = 100,
                   feature_set: str = "v2",
                   label_horizon: int = 1,
-                  label_thresh: float = 0.05) -> Tuple[pd.DataFrame, pd.Series]:
+                  label_thresh: float = 0.05,
+                  train_mode: str = "conditional") -> Tuple[pd.DataFrame, pd.Series]:
         """
         학습 데이터를 로드하고 전처리
 
@@ -153,34 +188,18 @@ class DirectionClassifierLGBM:
             verbose=False,
         )
 
-        print(f"✅ Loaded {len(df)} samples, {len(df.columns)} columns")
-
-        # 이벤트 데이터만 필터링 (label_1d_cls가 0이 아닌 경우)
-        event_df = df.filter(pl.col("label_1d_cls") != 0)
-        print(f"✅ Filtered to {len(event_df)} directional events")
-
-        if len(event_df) < 1000:
-            print(f"⚠️ Warning: Only {len(event_df)} samples available. Consider using more data.")
-
-        # Feature와 Target 분리
-        available_features = [f for f in self.feature_list if f in event_df.columns]
-        missing_features = [f for f in self.feature_list if f not in event_df.columns]
-
-        if missing_features:
-            print(f"⚠️ Missing features: {missing_features}")
-            print(f"📊 Using {len(available_features)} available features: {available_features}")
-
-        # pandas로 변환
-        feature_df = event_df.select(available_features).to_pandas()
-        target_series = event_df.select("label_1d_cls").to_pandas()["label_1d_cls"]
-
-        # Target 변환: -1, 1 -> 0, 1
-        y = ((target_series + 1) // 2).astype(int)
-
-        print(f"🎯 Target distribution: {y.value_counts().to_dict()}")
-        print(f"📊 Features shape: {feature_df.shape}")
-
-        return feature_df, y
+        df = self.add_prevday_turnover_feats(df)
+        if train_mode == "conditional":
+            # 이벤트일만: label_1d_cls ∈ {−1, +1}
+            df_train = df.filter(pl.col("label_1d_cls") != 0)
+            y = ((df_train["label_1d_cls"].to_pandas() + 1) // 2).astype(int)  # −1/ +1 → 0/1
+        else:
+            df_train = df
+            y = ((df_train["label_1d_cls"].to_pandas() + 1) // 2).astype(int)  # −1/ +1 → 0/1
+        
+        X_cols = [f for f in self.feature_list if f in df_train.columns]
+        X = df_train.select(X_cols).to_pandas().fillna(0.0)
+        return X, y
 
     def train(self,
               X: pd.DataFrame,
@@ -509,6 +528,7 @@ def create_direction_classifier_model(market: str = "KR",
                                     years: List[int] = [2018, 2019, 2020],
                                     validation_years: Optional[List[int]] = [2021],
                                     save_model: bool = True,
+                                    max_tickers: int = 100,
                                     model_dir: str = "models/saved") -> DirectionClassifierLGBM:
     """
     방향 분류 모델 생성 및 학습 (교차검증 + Validation 포함)
@@ -533,7 +553,7 @@ def create_direction_classifier_model(market: str = "KR",
     model = DirectionClassifierLGBM()
 
     # 데이터 로드
-    X, y = model.load_data(market=market, years=years)
+    X, y = model.load_data(market=market, years=years, max_tickers=max_tickers)
 
     # 모델 학습 (교차검증 + Validation 포함)
     metrics = model.train(X, y, validation_years=validation_years)
@@ -577,6 +597,7 @@ if __name__ == "__main__":
         market="KR",
         years=[2018, 2019, 2020],
         validation_years=[2021],
+        max_tickers=3000,
         save_model=True
     )
 
