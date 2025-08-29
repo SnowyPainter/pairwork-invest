@@ -2108,9 +2108,6 @@ class EventDetectorManager:
             pickle_path = model_path.with_suffix('.pkl')
             if pickle_path.exists():
                 try:
-                    # 모델 클래스들을 import하여 pickle이 찾을 수 있도록 함
-                    from models.M001_EventDetector import EventDetectorTCN, FocalLoss
-
                     with open(pickle_path, 'rb') as f:
                         metadata = pickle.load(f)
                     print(f"  ✅ Pickle 메타데이터 로드 성공")

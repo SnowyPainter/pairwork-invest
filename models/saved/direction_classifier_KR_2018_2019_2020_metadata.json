@@ -12,7 +12,7 @@
     "parkinson20",
     "stochd14",
     "vol_z20",
-    "vwap20turnover_rank_prev1",
+    "turnover_rank_prev1",
     "turnover_ratio_1d",
     "is_top100_prev1",
     "is_top300_prev1"

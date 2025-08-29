@@ -71,11 +71,9 @@ SELECTED_FEATURES = [
     # 거래량 그룹 (vol_z20 선택 - 표준화된 변동성)
     'vol_z20',
 
-    # VWAP 그룹 (vwap20 선택 - 더 긴 기간)
-    'vwap20'
-
-    # 전날 turnover 순위
-    "turnover_rank_prev1","turnover_ratio_1d","is_top100_prev1","is_top300_prev1"
+    'turnover_ratio_1d',
+    'is_top100_prev1',
+    'is_top300_prev1'
 ]
 
 class DirectionClassifierLGBM:

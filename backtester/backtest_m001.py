@@ -16,6 +16,7 @@ Event Top-K → Direction 필터 통합 백테스트 (안정화 리라이트)
 import os
 import sys
 import time
+import json
 from pathlib import Path
 import warnings
 warnings.filterwarnings('ignore')
@@ -36,6 +37,8 @@ from models.M001_EventDetector import (
     EventDetectorManager,
     create_event_detector_model,
     VOLATILITY_FEATURES,
+    TURNOVER_DERIVED_FEATURES,
+    ENHANCED_FEATURES,
 )
 from data.dataset_builder import build_dataset
 from backtester.backtester import (
@@ -48,6 +51,148 @@ from backtester.backtester import (
 # -----------------------------
 # 유틸
 # -----------------------------
+def load_model_metadata(model_path: str) -> dict:
+    """모델 메타데이터를 JSON에서 로드"""
+    # Direction Classifier의 경우: .txt -> _metadata.json
+    if model_path.endswith('.txt'):
+        json_path = model_path.replace('.txt', '_metadata.json')
+    # Event Detector의 경우: .pth -> .json
+    elif model_path.endswith('.pth'):
+        json_path = model_path.replace('.pth', '.json')
+    else:
+        # 다른 경우는 직접 .json 파일로 가정
+        json_path = model_path if model_path.endswith('.json') else f"{model_path}.json"
+
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except UnicodeDecodeError as e:
+            print(f"메타데이터 파일 인코딩 오류: {json_path} - {e}")
+            return {}
+        except json.JSONDecodeError as e:
+            print(f"메타데이터 JSON 파싱 오류: {json_path} - {e}")
+            return {}
+    else:
+        print(f"메타데이터 파일을 찾을 수 없음: {json_path}")
+        return {}
+
+def display_model_info(metadata: dict, model_type: str):
+    """모델 정보를 출력"""
+    if not metadata:
+        print(f"{model_type} 메타데이터를 찾을 수 없습니다.")
+        return
+
+    print(f"\n{model_type} 모델 정보:")
+    print(f"  피처 수: {len(metadata.get('features', []))}")
+    print(f"  주요 피처: {', '.join(metadata.get('features', [])[:5])}")
+
+    if 'training_history' in metadata:
+        hist = metadata['training_history']
+        print(f"  학습 정확도: {hist.get('accuracy', 'N/A'):.4f}")
+        print(f"  F1 스코어: {hist.get('f1_score', 'N/A'):.4f}")
+        print(f"  ROC-AUC: {hist.get('roc_auc', 'N/A'):.4f}")
+
+def create_extended_turnover_features(df: pl.DataFrame) -> pl.DataFrame:
+    """모든 turnover 기반 피처들을 한 번에 생성 (통합 함수)"""
+    if 'turnover' not in df.columns:
+        print("turnover 컬럼이 없어 확장 피처 생성을 건너뜁니다.")
+        return df
+
+    print("turnover 기반 모든 피처 생성 중...")
+
+    # 모든 turnover 피처들을 한 번에 생성 (단계별 적용으로 오류 방지)
+
+    # 1단계: 기본 파생 피처들 + Direction Classifier용 피처들
+    df = df.with_columns([
+        # Event Detector & Direction Classifier 공통 피처들
+        pl.when(pl.col("turnover").shift(1).is_null() | (pl.col("turnover").shift(1) == 0))
+          .then(0.0)
+          .otherwise((pl.col("turnover") / pl.col("turnover").shift(1)) - 1)
+          .over("ticker")
+          .alias("turnover_ratio_1d"),
+
+        # 현재 순위 계산 (여러 용도로 사용)
+        pl.col("turnover").rank(method="dense", descending=True).over(["date"]).alias("turnover_current_rank"),
+    ])
+
+    # 전일 순위 계산 (TURNOVER_DERIVED_FEATURES + Direction Classifier용)
+    df = df.with_columns([
+        pl.col("turnover_current_rank").shift(1).over("ticker").alias("turnover_rank_prev1"),
+    ])
+
+    # Direction Classifier용 추가 피처들
+    df = df.with_columns([
+        (pl.col("turnover_rank_prev1") <= 100).cast(pl.Int8).alias("is_top100_prev1"),
+        (pl.col("turnover_rank_prev1") <= 300).cast(pl.Int8).alias("is_top300_prev1"),
+    ])
+
+    # 2단계: 이동평균 계열
+    df = df.with_columns([
+        pl.col("turnover").rolling_mean(5).over("ticker").alias("turnover_ma5"),
+        pl.col("turnover").rolling_mean(10).over("ticker").alias("turnover_ma10"),
+        pl.col("turnover").rolling_mean(20).over("ticker").alias("turnover_ma20"),
+    ])
+
+    # 3단계: 표준편차 (변동성)
+    df = df.with_columns([
+        pl.col("turnover").rolling_std(5).over("ticker").alias("turnover_std5"),
+        pl.col("turnover").rolling_std(10).over("ticker").alias("turnover_std10"),
+        pl.col("turnover").rolling_std(20).over("ticker").alias("turnover_std20"),
+    ])
+
+    # 4단계: 추가 확장 피처들
+    df = df.with_columns([
+        # 백분위수 (turnover_current_rank와 동일하지만 명시적으로 생성)
+        pl.col("turnover").rank(method="dense", descending=True).over(["date"]).alias("turnover_percentile"),
+
+        # 모멘텀 계열
+        (pl.col("turnover") / pl.col("turnover").shift(5).over("ticker") - 1).alias("turnover_momentum5"),
+        (pl.col("turnover") / pl.col("turnover").shift(10).over("ticker") - 1).alias("turnover_momentum10"),
+    ])
+
+    # 5단계: 파생 계산들
+    df = df.with_columns([
+        # Z-score (표준화)
+        ((pl.col("turnover") - pl.col("turnover_ma20")) /
+         (pl.col("turnover_std20") + 1e-9)).alias("turnover_zscore"),
+
+        # 변동성 비율
+        (pl.col("turnover_std5") / (pl.col("turnover_ma5") + 1e-9)).alias("turnover_volatility_ratio"),
+
+        # 순위 변화
+        (pl.col("turnover_current_rank") - pl.col("turnover_rank_prev1")).alias("turnover_rank_change"),
+    ])
+
+    # 임시 컬럼 제거
+    df = df.drop(["turnover_current_rank"])
+
+    # 모든 turnover 피처들의 결측치 처리
+    all_turnover_cols = [
+        # 기본 파생 피처들 (TURNOVER_DERIVED_FEATURES)
+        "turnover_ratio_1d", "turnover_rank_prev1",
+
+        # Direction Classifier용 추가 피처들
+        "is_top100_prev1", "is_top300_prev1",
+
+        # 확장 피처들
+        "turnover_ma5", "turnover_ma10", "turnover_ma20",
+        "turnover_std5", "turnover_std10", "turnover_std20",
+        "turnover_zscore", "turnover_percentile",
+        "turnover_momentum5", "turnover_momentum10",
+        "turnover_volatility_ratio", "turnover_rank_change"
+    ]
+
+    # 결측치를 0.0으로 채움
+    for col in all_turnover_cols:
+        if col in df.columns:
+            df = df.with_columns([
+                pl.col(col).fill_null(0.0).alias(col)
+            ])
+
+    print(f"통합 피처 생성 완료: {len(all_turnover_cols)}개 피처 추가")
+    return df
+
 def _ensure_cols(df: pl.DataFrame, cols: list[str], fill: float = 0.0) -> pl.DataFrame:
     """df에 cols가 모두 존재하도록 누락 열 추가(상수 fill), 열 순서 보전."""
     miss = [c for c in cols if c not in df.columns]
@@ -193,7 +338,7 @@ def run_event_topk_direction_backtest(
     years_train: list[int] = [2018, 2019, 2020],
     years_test: list[int] = [2021],
     max_tickers: int = 50,
-    top_k: int = 10,
+    top_k: int = 5,  # Precision@5의 높은 정확도를 고려하여 5로 설정
     dir_prob_thresh: float = 0.6,
     move_exit_pct: float = 0.05,
 ) -> dict | None:
@@ -218,6 +363,10 @@ def run_event_topk_direction_backtest(
         print(f"  기존 모델 로드: {dir_model_path}")
         direction_model = DirectionClassifierLGBM()
         direction_model.load_model(dir_model_path)
+
+        # 모델 메타데이터 표시
+        dir_metadata = load_model_metadata(dir_model_path)
+        display_model_info(dir_metadata, "Direction Classifier")
     else:
         print("  신규 학습 실행…")
         direction_model = create_direction_classifier_model(
@@ -235,6 +384,10 @@ def run_event_topk_direction_backtest(
             device="auto",
         )
         event_model.load_model(ev_model_stub)
+
+        # 모델 메타데이터 표시
+        ev_metadata = load_model_metadata(f"{ev_model_stub}.pth")
+        display_model_info(ev_metadata, "Event Detector")
     else:
         print("  신규 TCN 학습 실행…(참고: 내부 스케일링/보정 적용)")
         event_model = create_event_detector_model(
@@ -266,19 +419,60 @@ def run_event_topk_direction_backtest(
         verbose=True,
     )
     print(f"  테스트 데이터: {test_df.height:,} 행, {len(test_df.columns)} 열")
-    
-    # 사용 가능 피처 출력
-    ev_avail = [c for c in VOLATILITY_FEATURES if c in test_df.columns]
+
+    # 모든 turnover 기반 피처 생성 (통합)
+    test_df = create_extended_turnover_features(test_df)
+
+    # 사용 가능 피처 출력 (업데이트된 피처 세트 사용)
+    ev_base_avail = [c for c in VOLATILITY_FEATURES if c in test_df.columns]
+    ev_derived_avail = [c for c in TURNOVER_DERIVED_FEATURES if c in test_df.columns]
+
+    # 확장 turnover 피처들 (Event Detector용)
+    extended_turnover_features = [
+        "turnover_ma5", "turnover_ma10", "turnover_ma20",
+        "turnover_std5", "turnover_std10", "turnover_std20",
+        "turnover_zscore", "turnover_percentile",
+        "turnover_momentum5", "turnover_momentum10",
+        "turnover_volatility_ratio", "turnover_rank_change"
+    ]
+    extended_avail = [c for c in extended_turnover_features if c in test_df.columns]
+
+    # Direction Classifier 피처들 (이제 통합 함수에서 생성됨)
+    dir_turnover_features = [
+        "turnover_rank_prev1", "turnover_ratio_1d",
+        "is_top100_prev1", "is_top300_prev1"
+    ]
+    dir_turnover_avail = [c for c in dir_turnover_features if c in test_df.columns]
+
     dir_avail = [c for c in SELECTED_FEATURES if c in test_df.columns]
-    print(f"  Event 피처: {len(ev_avail)}/{len(VOLATILITY_FEATURES)} 사용")
-    print(f"  Dir   피처: {len(dir_avail)}/{len(SELECTED_FEATURES)} 사용")
+
+    print("  피처 현황:")
+    print(f"    Event 기본 피처: {len(ev_base_avail)}/{len(VOLATILITY_FEATURES)} 사용")
+    print(f"    Turnover 파생 피처: {len(ev_derived_avail)}/{len(TURNOVER_DERIVED_FEATURES)} 사용")
+    print(f"    Turnover 확장 피처: {len(extended_avail)}/{len(extended_turnover_features)} 사용")
+    print(f"    Direction 기본 피처: {len(dir_avail)}/{len(SELECTED_FEATURES)} 사용")
+    print(f"    Direction Turnover 피처: {len(dir_turnover_avail)}/{len(dir_turnover_features)} 사용")
 
     miss_ev = [c for c in VOLATILITY_FEATURES if c not in test_df.columns]
+    miss_derived = [c for c in TURNOVER_DERIVED_FEATURES if c not in test_df.columns]
+    miss_extended = [c for c in extended_turnover_features if c not in test_df.columns]
+    miss_dir_turnover = [c for c in dir_turnover_features if c not in test_df.columns]
     miss_dir = [c for c in SELECTED_FEATURES if c not in test_df.columns]
+
     if miss_ev:
-        print(f"  [경고] Event 누락 피처: {miss_ev}")
+        print(f"  Event 기본 피처 누락: {miss_ev}")
+    if miss_derived:
+        print(f"  Event Turnover 파생 피처 누락: {miss_derived}")
+    if miss_extended:
+        print(f"  Event Turnover 확장 피처 누락: {miss_extended}")
+    if miss_dir_turnover:
+        print(f"  Direction Turnover 피처 누락: {miss_dir_turnover}")
     if miss_dir:
-        print(f"  [경고] Direction 누락 피처: {miss_dir}")
+        print(f"  Direction 기본 피처 누락: {miss_dir}")
+
+    # Turnover 파생 피처가 없는 경우 경고
+    if not ev_derived_avail:
+        print("  Turnover 파생 피처가 없습니다. 모델 성능에 영향이 있을 수 있습니다.")
 
     # 4) 신호 생성
     print("\n[신호 생성: Event Top-K → Direction]")
@@ -361,14 +555,14 @@ def run_event_topk_direction_backtest(
 
 
 def main():
-    print("🎯 Event Top-K → Direction 필터 백테스트 (안정화 버전)")
+    print("Event Top-K -> Direction 필터 백테스트")
     MARKET = "KR"
     TRAIN_YEARS = [2018, 2019, 2020]
-    TEST_YEARS = [2020, 2021]
-    MAX_TICKERS = 100
-    TOP_K = 10
+    TEST_YEARS = [2021]
+    MAX_TICKERS = 3000
+    TOP_K = 10  # Precision@5의 높은 정확도를 고려하여 5로 설정
     DIR_PTH = 0.5  # 상승확률 임계
-    MOVE_EXIT = 0.05
+    MOVE_EXIT = 0.1
 
     try:
         result = run_event_topk_direction_backtest(
@@ -381,12 +575,31 @@ def main():
             move_exit_pct=MOVE_EXIT,
         )
         if result:
-            print("\n✅ 완료: reports/backtest_trigger_size/ 폴더를 확인하세요.")
+            print("\n완료: reports/backtest_trigger_size/ 폴더를 확인하세요.")
         else:
-            print("\n❌ 실패")
+            print("\n실패")
     except KeyboardInterrupt:
-        print("\n⏹️ 중단됨")
+        print("\n중단됨")
 
 
 if __name__ == "__main__":
     main()
+
+    # 추가: 빠른 테스트를 위한 함수
+    def quick_test():
+        """빠른 테스트 실행 (적은 데이터로)"""
+        print("\n빠른 테스트 모드")
+        result = run_event_topk_direction_backtest(
+            market="KR",
+            years_train=[2018, 2019],
+            years_test=[2020],
+            max_tickers=20,  # 적은 종목으로 빠른 테스트
+            top_k=5,
+            dir_prob_thresh=0.5,
+            move_exit_pct=0.05,
+        )
+        return result
+
+    # 사용법:
+    # python backtester/backtest_m001.py  # 전체 테스트
+    # 또는 코드에서 quick_test() 호출 # 빠른 테스트
