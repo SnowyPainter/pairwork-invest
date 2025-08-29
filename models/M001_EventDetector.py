@@ -34,6 +34,7 @@ import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use("Agg")
 import seaborn as sns
+from tqdm import tqdm
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, precision_recall_curve, auc, f1_score, precision_score, recall_score, balanced_accuracy_score
@@ -194,15 +195,19 @@ VOLATILITY_FEATURES = [
     'obv',
     'cmf20',
     'cci20',            # Volume indicators
+
+    # Turnover 관련 지표 (기본 피처)
+    'turnover',                # Turnover (기본 제공)
 ]
 
+# 동적으로 생성되는 Turnover 기반 피처들
+TURNOVER_DERIVED_FEATURES = [
+    'turnover_rank_prev1',     # 전일 Turnover 랭킹 (동적 생성)
+    'turnover_ratio_1d',       # 1일 Turnover 비율 (동적 생성)
+]
 
-
-
-
-# 통합 피처 세트 (변동성 피처만 사용)
-ENHANCED_FEATURES = VOLATILITY_FEATURES
-
+# 전체 피처 세트 (기본 + 동적 생성)
+ENHANCED_FEATURES = VOLATILITY_FEATURES + TURNOVER_DERIVED_FEATURES
 
 class TimeSeriesDataset(Dataset):
     """
@@ -373,7 +378,7 @@ class EventDetectorManager:
         self.sequence_length = sequence_length
         self.dropout = dropout
 
-        # 레짐 변경 감지용 고급 피처 세트 무조건 사용
+        # 레짐 변경 감지용 고급 피처 세트 무조건 사용 (기본 + 동적 생성)
         self.features = ENHANCED_FEATURES
 
         # TCN 채널 설정
@@ -409,13 +414,14 @@ class EventDetectorManager:
 
 
 
-    def _create_class_balanced_sampler(self, targets: torch.Tensor) -> WeightedRandomSampler:
+    def _create_class_balanced_sampler(self, targets: torch.Tensor, turnover_ranks: torch.Tensor = None) -> WeightedRandomSampler:
         """
-        Class-balanced sampler 생성
-        클래스 불균형 문제를 해결하기 위한 가중치 기반 샘플러
+        Turnover 랭킹 기반 가중치가 적용된 Class-balanced sampler 생성
+        클래스 불균형 문제 해결 + Turnover Top 종목에 추가 가중치 부여
 
         Args:
             targets: 타겟 라벨 텐서
+            turnover_ranks: 전일 Turnover 랭킹 텐서 (선택사항)
 
         Returns:
             WeightedRandomSampler
@@ -423,8 +429,30 @@ class EventDetectorManager:
         class_counts = torch.bincount(targets)
         class_weights = 1.0 / class_counts.float()
 
-        # 각 샘플의 가중치 계산
+        # 기본 클래스 가중치 계산
         sample_weights = class_weights[targets]
+
+        # Turnover 랭킹 기반 추가 가중치 적용 (선택사항)
+        if turnover_ranks is not None:
+            # Turnover 가중치 계산
+            turnover_weights = torch.ones_like(turnover_ranks, dtype=torch.float32)
+
+            # Top 100 종목 (랭킹 1-100): 2.0배 가중치
+            top100_mask = (turnover_ranks >= 1) & (turnover_ranks <= 100)
+            turnover_weights[top100_mask] = 2.0
+
+            # Top 300 종목 (랭킹 101-300): 1.5배 가중치
+            top300_mask = (turnover_ranks >= 101) & (turnover_ranks <= 300)
+            turnover_weights[top300_mask] = 1.5
+
+            # Top 1000 종목 (랭킹 301-1000): 1.2배 가중치
+            top1000_mask = (turnover_ranks >= 301) & (turnover_ranks <= 1000)
+            turnover_weights[top1000_mask] = 1.2
+
+            # 1000위 이하: 1.0배 (기본 가중치)
+
+            # 최종 가중치 = 클래스 가중치 × Turnover 가중치
+            sample_weights = sample_weights * turnover_weights
 
         # WeightedRandomSampler 생성
         sampler = WeightedRandomSampler(
@@ -1018,8 +1046,130 @@ class EventDetectorManager:
             calibrated_probs = probabilities
 
         return calibrated_probs
-    
-    def load_data(self, market: str = "KR", years: List[int] = [2018, 2019, 2020], 
+
+    def _create_turnover_features(self, df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Turnover 기반 피처들을 생성
+        - turnover_rank_prev1: 전일 기준 종목별 turnover 순위
+        - turnover_ratio_1d: 1일 turnover 비율 변화
+
+        Args:
+            df: 입력 데이터프레임 (turnover 컬럼 포함)
+
+        Returns:
+            turnover 기반 피처들이 추가된 데이터프레임
+        """
+        print("  🔄 Turnover 기반 피처 생성 중...")
+
+        # turnover 컬럼 존재 확인
+        if 'turnover' not in df.columns:
+            print("  ⚠️ turnover 컬럼이 존재하지 않습니다. 기본값으로 설정합니다.")
+            df = df.with_columns([
+                pl.lit(0.0).alias("turnover_rank_prev1"),
+                pl.lit(0.0).alias("turnover_ratio_1d")
+            ])
+            return df
+
+        # 날짜순으로 정렬
+        df_sorted = df.sort(["date", "ticker"])
+
+        # 1. turnover_ratio_1d 계산: (당일 turnover / 전일 turnover) - 1
+        df_with_ratio = df_sorted.with_columns([
+            pl.when(pl.col("turnover").shift(1).is_null() | (pl.col("turnover").shift(1) == 0))
+              .then(None)
+              .otherwise((pl.col("turnover") / pl.col("turnover").shift(1)) - 1)
+              .over("ticker")  # 종목별로 그룹화하여 계산
+              .alias("turnover_ratio_1d")
+        ])
+
+        # 2. turnover_rank_prev1 계산: 전일 turnover 순위
+        # 날짜별로 turnover 순위를 계산하고 다음 날에 적용
+        dates = df_with_ratio.select("date").unique().sort("date").to_series().to_list()
+
+        turnover_ranks_list = []
+
+        for current_date in dates:
+            # 현재 날짜의 데이터
+            current_data = df_with_ratio.filter(pl.col("date") == current_date)
+
+            if len(current_data) == 0:
+                continue
+
+            # turnover 기준 내림차순 정렬 (높은 turnover일수록 순위 높음)
+            turnover_values = current_data.select(["ticker", "turnover"]).to_pandas()
+
+            # 결측치 처리
+            turnover_values["turnover"] = turnover_values["turnover"].fillna(0)
+
+            # 순위 계산 (1부터 시작, 같은 값은 평균 순위)
+            turnover_values["rank"] = turnover_values["turnover"].rank(method="average", ascending=False).astype(int)
+
+            # 다음 날짜 계산
+            try:
+                current_date_obj = pd.to_datetime(current_date).date()
+                next_date_idx = dates.index(current_date) + 1
+                if next_date_idx < len(dates):
+                    next_date = dates[next_date_idx]
+
+                    # 다음 날 데이터에 현재 날짜의 순위를 적용
+                    next_data = df_with_ratio.filter(pl.col("date") == next_date)
+
+                    if len(next_data) > 0:
+                        next_tickers = next_data.select("ticker").to_series().to_list()
+
+                        for ticker in next_tickers:
+                            rank_row = turnover_values[turnover_values["ticker"] == ticker]
+                            if len(rank_row) > 0:
+                                rank = rank_row["rank"].iloc[0]
+                                turnover_ranks_list.append({
+                                    "date": next_date,
+                                    "ticker": ticker,
+                                    "turnover_rank_prev1": rank
+                                })
+            except Exception as e:
+                print(f"    [경고] {current_date} 날짜 처리 중 오류: {e}")
+                continue
+
+        # turnover_rank_prev1을 데이터프레임에 추가
+        if turnover_ranks_list:
+            ranks_df = pl.DataFrame(turnover_ranks_list)
+            df_final = df_with_ratio.join(
+                ranks_df,
+                on=["date", "ticker"],
+                how="left"
+            ).with_columns([
+                pl.col("turnover_rank_prev1").fill_null(9999)  # 결측치는 낮은 우선순위 부여
+            ])
+        else:
+            df_final = df_with_ratio.with_columns([
+                pl.lit(9999).alias("turnover_rank_prev1")
+            ])
+
+        # 결측치 처리
+        df_final = df_final.with_columns([
+            pl.col("turnover_ratio_1d").fill_null(0.0)  # 결측치는 0으로 처리
+        ])
+
+        # 생성된 피처 통계 출력
+        turnover_stats = df_final.select([
+            pl.col("turnover_rank_prev1").min().alias("min_rank"),
+            pl.col("turnover_rank_prev1").max().alias("max_rank"),
+            pl.col("turnover_rank_prev1").mean().alias("avg_rank"),
+            pl.col("turnover_ratio_1d").mean().alias("avg_ratio"),
+            pl.col("turnover_ratio_1d").std().alias("std_ratio"),
+            (pl.col("turnover_rank_prev1") <= 100).sum().alias("top100_count"),
+            (pl.col("turnover_rank_prev1") <= 300).sum().alias("top300_count"),
+            (pl.col("turnover_rank_prev1") <= 1000).sum().alias("top1000_count")
+        ]).row(0)
+
+        print("  ✅ Turnover 기반 피처 생성 완료:")
+        print(f"    turnover_rank_prev1 - 범위: {turnover_stats[0]} ~ {turnover_stats[1]}, 평균: {turnover_stats[2]:.1f}")
+        print(f"    turnover_ratio_1d - 평균: {turnover_stats[3]:.4f}, 표준편차: {turnover_stats[4]:.4f}")
+        print(f"    순위 분포 - Top100: {turnover_stats[5]}개, Top300: {turnover_stats[6]}개, Top1000: {turnover_stats[7]}개")
+
+        return df_final
+
+    def load_data(self, market: str = "KR", years: List[int] = [2018, 2019, 2020],
                   max_tickers: int = 100, normalize_features: bool = False) -> pl.DataFrame:
         """
         학습용 데이터 로드
@@ -1048,7 +1198,10 @@ class EventDetectorManager:
         )
         
         print(f"  로드된 데이터: {len(df):,} 행 × {len(df.columns)} 열")
-        
+
+        # Turnover 기반 피처 생성 (turnover_rank_prev1, turnover_ratio_1d)
+        df = self._create_turnover_features(df)
+
         # 이벤트 라벨 계산 (초기 threshold로)
         df_with_events = self._calculate_event_labels(df)
         
@@ -1250,7 +1403,40 @@ class EventDetectorManager:
         if use_class_balanced_sampler:
             # 클래스 균형 샘플러 사용
             train_targets = torch.tensor([train_dataset[i][1] for i in range(len(train_dataset))])
-            train_sampler = self._create_class_balanced_sampler(train_targets)
+
+            # Turnover 랭킹 기반 가중치 적용 (turnover_rank_prev1 피처가 있는 경우)
+            train_turnover_ranks = None
+            # turnover_rank_prev1은 동적으로 생성된 피처이므로 train_processed_df에서 직접 확인
+            if 'turnover_rank_prev1' in train_processed_df.columns:
+                try:
+                    # train_processed_df에서 turnover_rank_prev1 추출
+                    turnover_ranks_list = []
+                    for i in range(len(train_dataset)):
+                        # TimeSeriesDataset의 __getitem__에서 시퀀스의 마지막 값 사용
+                        seq_end_idx = train_dataset.valid_indices[i] + train_dataset.sequence_length
+                        if seq_end_idx <= len(train_processed_df):
+                            turnover_rank = train_processed_df.select('turnover_rank_prev1').row(seq_end_idx - 1)[0]
+                            # 결측치 및 유효성 처리
+                            if turnover_rank is None or pd.isna(turnover_rank) or turnover_rank <= 0:
+                                turnover_rank = 9999  # 낮은 우선순위 부여
+                            turnover_ranks_list.append(float(turnover_rank))
+
+                    if len(turnover_ranks_list) == len(train_dataset):
+                        train_turnover_ranks = torch.tensor(turnover_ranks_list, dtype=torch.float32)
+                        print(f"  📊 Turnover 랭킹 기반 가중치 적용: {len(turnover_ranks_list)}개 샘플")
+                        # Turnover 랭킹 분포 확인
+                        ranks_np = train_turnover_ranks.numpy()
+                        top100_count = np.sum((ranks_np >= 1) & (ranks_np <= 100))
+                        top300_count = np.sum((ranks_np >= 101) & (ranks_np <= 300))
+                        top1000_count = np.sum((ranks_np >= 301) & (ranks_np <= 1000))
+                        print(f"    Top 100: {top100_count}개, Top 300: {top300_count}개, Top 1000: {top1000_count}개")
+                    else:
+                        print(f"  ⚠️ Turnover 랭킹 데이터 불일치: {len(turnover_ranks_list)} vs {len(train_dataset)}")
+                except Exception as e:
+                    print(f"  ⚠️ Turnover 랭킹 추출 실패: {e}")
+                    train_turnover_ranks = None
+
+            train_sampler = self._create_class_balanced_sampler(train_targets, train_turnover_ranks)
             train_loader = DataLoader(train_dataset, batch_size=batch_size,
                                     sampler=train_sampler, drop_last=True)
         else:
@@ -1280,12 +1466,19 @@ class EventDetectorManager:
         patience_counter = 0
 
         print("  TCN 학습 시작...")
-        for epoch in range(epochs):
+
+        # tqdm을 사용한 에포크 루프
+        epoch_progress = tqdm(range(epochs), desc="Training Epochs", position=0, leave=True)
+        for epoch in epoch_progress:
             # 학습
             self.model.train()
             train_loss = 0.0
 
-            for batch_x, batch_y in train_loader:
+            # tqdm을 사용한 배치 단위 학습
+            batch_progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} - Training",
+                                position=1, leave=False, total=len(train_loader))
+
+            for batch_x, batch_y in batch_progress:
                 batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
 
                 optimizer.zero_grad()
@@ -1295,8 +1488,11 @@ class EventDetectorManager:
                 optimizer.step()
 
                 train_loss += loss.item()
+                # 배치별 평균 loss 표시
+                batch_progress.set_postfix({'batch_loss': f'{loss.item():.4f}'})
 
             train_loss /= len(train_loader)
+            batch_progress.close()  # 배치 진행바 닫기
 
             # 검증
             self.model.eval()
@@ -1305,8 +1501,12 @@ class EventDetectorManager:
             all_targets = []
             all_probs = []
 
+            # tqdm을 사용한 검증 배치 진행바
+            valid_progress = tqdm(valid_loader, desc=f"Epoch {epoch+1}/{epochs} - Validation",
+                                position=1, leave=False, total=len(valid_loader))
+
             with torch.no_grad():
-                for batch_x, batch_y in valid_loader:
+                for batch_x, batch_y in valid_progress:
                     batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
 
                     outputs = self.model(batch_x)
@@ -1319,6 +1519,11 @@ class EventDetectorManager:
                     all_preds.extend(preds.cpu().numpy())
                     all_targets.extend(batch_y.cpu().numpy())
                     all_probs.extend(probs.cpu().numpy())
+
+                    # 검증 배치별 loss 표시
+                    valid_progress.set_postfix({'valid_loss': f'{loss.item():.4f}'})
+
+            valid_progress.close()  # 검증 진행바 닫기
 
             # 리스트를 numpy array로 변환
             all_targets = np.array(all_targets)
@@ -1373,6 +1578,19 @@ class EventDetectorManager:
                 balanced_acc = 0.0
                 precision_at_k_results = {}
 
+            # tqdm 진행바에 실시간 지표 표시
+            epoch_progress.set_postfix({
+                'train_loss': f'{train_loss:.4f}',
+                'valid_loss': f'{valid_loss:.4f}',
+                'f1': f'{f1:.4f}',
+                'precision': f'{p_score:.4f}',
+                'recall': f'{r_score:.4f}',
+                'roc_auc': f'{roc_auc:.4f}',
+                'pr_auc': f'{pr_auc:.4f}',
+                'best_f1': f'{best_f1:.4f}'
+            })
+
+            # 상세 출력은 여전히 5에포크마다 (진행바 외에 추가 정보)
             if (epoch + 1) % 5 == 0:
                 print(f"    Epoch {epoch+1:3d}/{epochs} | Train Loss: {train_loss:.4f} | Valid Loss: {valid_loss:.4f}")
                 print(f"      F1: {f1:.4f} | Precision: {p_score:.4f} | Recall: {r_score:.4f}")
@@ -1393,6 +1611,7 @@ class EventDetectorManager:
 
             if patience_counter >= patience:
                 print(f"    Early stopping at epoch {epoch+1}")
+                epoch_progress.close()  # 진행바 닫기
                 break
 
             scheduler.step()
@@ -1400,6 +1619,9 @@ class EventDetectorManager:
         # 최적 모델 복원
         if best_model_state is not None:
             self.model.load_state_dict(best_model_state)
+
+        # tqdm 진행바 닫기
+        epoch_progress.close()
 
         print("[학습 결과]")
         print(f"  정확도: {accuracy:.3f}")
@@ -1520,8 +1742,11 @@ class EventDetectorManager:
         all_probs = []
         all_preds = []
 
+        # tqdm을 사용한 예측 진행바
+        pred_progress = tqdm(pred_loader, desc="Predicting", total=len(pred_loader))
+
         with torch.no_grad():
-            for batch_x, _ in pred_loader:
+            for batch_x, _ in pred_progress:
                 batch_x = batch_x.to(self.device)
 
                 outputs = self.model(batch_x)
@@ -1530,6 +1755,8 @@ class EventDetectorManager:
 
                 all_probs.extend(probs.cpu().numpy())
                 all_preds.extend(preds.cpu().numpy())
+
+        pred_progress.close()  # 예측 진행바 닫기
 
         # 전체 데이터 길이에 맞게 결과 확장 (안전한 인덱스 매핑)
         y_pred_proba = np.full(len(df), np.nan)  # NaN으로 초기화하여 예측되지 않은 행 구분
@@ -1551,7 +1778,7 @@ class EventDetectorManager:
                 if data_idx < len(df):
                     y_pred_proba[data_idx] = all_probs[i]
                     y_pred[data_idx] = all_preds[i]
-        
+
         return y_pred.astype(int), y_pred_proba
     
     def evaluate(self, df: pl.DataFrame, target_col: str = "big_move_event",
@@ -1624,8 +1851,11 @@ class EventDetectorManager:
         all_probs = []
         all_preds = []
 
+        # tqdm을 사용한 평가 진행바
+        eval_progress = tqdm(eval_loader, desc="Evaluating", total=len(eval_loader))
+
         with torch.no_grad():
-            for batch_x, batch_y in eval_loader:
+            for batch_x, batch_y in eval_progress:
                 batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
 
                 outputs = self.model(batch_x)
@@ -1635,6 +1865,8 @@ class EventDetectorManager:
                 all_targets.extend(batch_y.cpu().numpy())
                 all_probs.extend(probs.cpu().numpy())
                 all_preds.extend(preds.cpu().numpy())
+
+        eval_progress.close()  # 평가 진행바 닫기
 
         # 평가 지표 계산
         y_true = np.array(all_targets)
@@ -2071,7 +2303,7 @@ if __name__ == "__main__":
             years=[2018, 2019, 2020],
             threshold=1.0,  # ATR%의 1배 (자동 튜닝됨)
             target="big_move_event",
-            max_tickers=500,
+            max_tickers=3000,
             save_model=True,
             sequence_length=60,
             batch_size=64,
