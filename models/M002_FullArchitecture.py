@@ -409,9 +409,8 @@ class M002FullArchitecture:
         data = self._prepare_head_dataset()
         self.head_features = data["available_head_features"]
 
-        params = getattr(self, "best_head_params", None)
-        if params is None:
-            params = self._default_head_params()
+        # Always use default parameters (skip Optuna tuning)
+        params = self._default_head_params()
 
         head_metrics = self._fit_head_models(data, params["clf"], params["reg"])
 

@@ -10,10 +10,62 @@ import polars as pl
 import torch
 from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset
+from typing import List, Tuple
 from tqdm import tqdm
 
 from data.dataset_builder import build_dataset
 from .M002_constants import STATE_NAMES, STATE_TO_ID
+
+
+def balanced_collate_fn(batch: List[Tuple[Tensor, Tensor]], num_classes: int) -> Tuple[Tensor, Tensor]:
+    """
+    Collate function that creates balanced batches by oversampling minority classes within each batch.
+
+    Args:
+        batch: List of (sequence, label) tuples
+        num_classes: Number of classes
+
+    Returns:
+        Tuple of (sequences, labels) with balanced class distribution
+    """
+    if not batch:
+        raise ValueError("Empty batch")
+
+    sequences, labels = zip(*batch)
+
+    # Group samples by class
+    class_samples = {i: [] for i in range(num_classes)}
+    for seq, label in zip(sequences, labels):
+        class_samples[label.item()].append(seq)
+
+    # Find the maximum number of samples per class in this batch (only for classes with samples)
+    available_classes = [i for i, samples in class_samples.items() if samples]
+    if not available_classes:
+        raise ValueError("No samples found in batch")
+
+    max_samples_per_class = max(len(class_samples[i]) for i in available_classes)
+
+    # Oversample each available class to match max_samples_per_class
+    balanced_sequences = []
+    balanced_labels = []
+
+    for class_id in available_classes:
+        class_seqs = class_samples[class_id]
+
+        # Oversample by repeating existing samples
+        oversampled_seqs = class_seqs * (max_samples_per_class // len(class_seqs))
+        remaining = max_samples_per_class % len(class_seqs)
+        if remaining > 0:
+            oversampled_seqs.extend(class_seqs[:remaining])
+
+        balanced_sequences.extend(oversampled_seqs)
+        balanced_labels.extend([class_id] * max_samples_per_class)
+
+    # Convert to tensors
+    balanced_sequences_tensor = torch.stack(balanced_sequences)
+    balanced_labels_tensor = torch.tensor(balanced_labels, dtype=torch.long)
+
+    return balanced_sequences_tensor, balanced_labels_tensor
 
 
 DEFAULT_REGIME_FEATURES: Sequence[str] = (
@@ -37,72 +89,121 @@ DEFAULT_REGIME_FEATURES: Sequence[str] = (
     "delta_macd",
 )
 
-
 def _assign_regime_labels(df: pl.DataFrame) -> pl.DataFrame:
-    """Heuristic regime labeling based on curvature & event structure."""
-    
-    state_expr = (
-        # --- 1. 하락 피로 구간: Breakdown Late (U형 하단 중앙)
-        pl.when(pl.col("I_bd_late") == 1)
-        .then(pl.lit("LateDown"))
+    """Balanced heuristic regime labeling (priority-based, vectorized, STATE_NAMES aligned)."""
 
-        # --- 2. 초기 상승 or 반등: Volume Regain / Rebound Candidate / 모멘텀 전환
-        .when(
-            (pl.col("event_volume_regain") == 1)
-            | (pl.col("event_rebound_candidate") == 1)
-            | (
-                (pl.col("ema_spread_rel") > 0)
-                & (pl.col("price_slope") > 0)
-                & (pl.col("rsi_smooth") > 45)
-            )
-        )
-        .then(pl.lit("EarlyUp"))
+    PRIORITIES = {
+        "Accumulation": 4,
+        "EarlyUp": 3,
+        "Peak": 5,
+        "Distribution": 1,
+        "LateDown": 2,
+    }
 
-        # --- 3. 정체 or 조정(상단 구간)
-        .when(
-            (pl.col("event_exhaustion_candidate") == 1)
-            | (pl.col("I_bd_early") == 1)
-            | (
-                (pl.col("pos_in_band_rel") > 0.85)
-                & (pl.col("rsi_smooth") > 60)
-                & (pl.col("delta_rsi") < 0)
-            )
-        )
-        .then(pl.lit("Peak"))
-
-        # --- 4. 저점 횡보 (거래량 약함 + 밴드 하단)
-        .when(
-            (pl.col("pos_in_band_rel") < 0.35)
-            & (pl.col("atr_rel") < 1.05)
-            & (pl.col("volume_z") < 0.5)
-            & (pl.col("event_breakdown_risk") == 0)
-        )
-        .then(pl.lit("Accumulation"))
-
-        # --- 5. 그 외는 분배/하락 확산 구간
-        .otherwise(pl.lit("Distribution"))
+    # --- Conditions (slightly relaxed)
+    cond_accum = (
+        (pl.col("pos_in_band_rel") < 0.4)
+        & (pl.col("atr_rel") < 1.2)
+        & (pl.col("volume_z") < 1.0)
     )
 
+    cond_early_up = (
+        (pl.col("event_volume_regain") == 1)
+        | (pl.col("event_rebound_candidate") == 1)
+        | (
+            (pl.col("ema_spread_rel") > -0.05)
+            & (pl.col("price_slope") > -0.01)
+            & (pl.col("rsi_smooth") > 40)
+        )
+    )
+
+    cond_peak = (
+        (pl.col("event_exhaustion_candidate") == 1)
+        | (pl.col("I_bd_early") == 1)
+        | (
+            (pl.col("pos_in_band_rel") > 0.8)
+            & (pl.col("rsi_smooth") > 55)
+            & (pl.col("delta_rsi") < 0.5)
+        )
+    )
+
+    cond_distribution = (
+        (pl.col("event_breakdown_risk") == 1)
+        | (
+            (pl.col("pos_in_band_rel") > 0.55)
+            & (pl.col("price_slope") < 0.0)
+            & (pl.col("rsi_smooth") < 60)
+        )
+    )
+
+    cond_late_down = (
+        (pl.col("I_bd_late") == 1)
+        | (
+            (pl.col("event_rebound_candidate") == 1)
+            & (pl.col("curv_2") > -0.5)     # 완화
+            & (pl.col("ema_spread_rel") > -0.5)
+            & (pl.col("price_slope") < 0.1) # 약한 하락 모멘텀 포함
+        )
+        | (
+            (pl.col("pos_in_band_rel") < 0.45)
+            & (pl.col("rsi_smooth") < 50)
+            & (pl.col("delta_rsi") < 0)
+        )
+    )
+
+
+    # --- Score columns (force to Int32)
     df = df.with_columns([
-        state_expr.alias("regime_state"),
+        pl.when(cond_accum).then(PRIORITIES["Accumulation"]).otherwise(0).cast(pl.Int32).alias("score_Accumulation"),
+        pl.when(cond_early_up).then(PRIORITIES["EarlyUp"]).otherwise(0).cast(pl.Int32).alias("score_EarlyUp"),
+        pl.when(cond_peak).then(PRIORITIES["Peak"]).otherwise(0).cast(pl.Int32).alias("score_Peak"),
+        pl.when(cond_distribution).then(PRIORITIES["Distribution"]).otherwise(0).cast(pl.Int32).alias("score_Distribution"),
+        pl.when(cond_late_down).then(PRIORITIES["LateDown"]).otherwise(0).cast(pl.Int32).alias("score_LateDown"),
     ])
+
+    score_cols = [f"score_{s}" for s in STATE_NAMES]
+
+    # --- Find max score index using struct and map_elements
+    score_struct = pl.struct(score_cols)
+
+    def get_max_score_index(score_struct):
+        """Get index of state with maximum score."""
+        scores = [score_struct[col] for col in score_cols]
+        max_score = max(scores)
+        max_indices = [i for i, score in enumerate(scores) if score == max_score]
+        # Return the smallest index (earliest in STATE_NAMES) in case of ties
+        return min(max_indices)
+
     df = df.with_columns([
-        pl.col("regime_state")
-        .replace(STATE_TO_ID)
-        .cast(pl.Int8)
-        .alias("regime_state_id")
+        score_struct.map_elements(get_max_score_index, return_dtype=pl.Int32).alias("max_idx")
     ])
+
+    df = df.with_columns([
+        df["max_idx"].map_elements(lambda i: STATE_NAMES[int(i)], return_dtype=pl.Utf8).alias("regime_state")
+    ])
+
+    # Clean-up
+    df = df.drop(score_cols + ["max_idx"])
+
+    # Map to ID
+    df = df.with_columns([
+        pl.col("regime_state").replace(STATE_TO_ID).cast(pl.Int8).alias("regime_state_id")
+    ])
+
+    print("✅ Regime Label Distribution:")
+    print(df["regime_state"].value_counts().sort("regime_state"))
     return df
+
 
 @dataclass
 class RegimeConfig:
     feature_columns: Sequence[str] = field(default_factory=lambda: DEFAULT_REGIME_FEATURES)
     seq_len: int = 20
-    hidden_size: int = 128
+    hidden_size: int = 64
     num_layers: int = 2
-    dropout: float = 0.2
+    dropout: float = 0.1
     batch_size: int = 128
-    max_epochs: int = 30
+    max_epochs: int = 15
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     valid_ratio: float = 0.2
@@ -110,6 +211,9 @@ class RegimeConfig:
     market: str = "US"
     years: Sequence[int] = field(default_factory=lambda: list(range(2010, 2019)))
     random_seed: int = 42
+    balance_classes: bool = True
+    class_weight_power: float = 0.5
+    label_smoothing: float = 0.15
 
     def device(self) -> torch.device:
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -157,6 +261,14 @@ class M002RegimeClassifier:
         self.model: Optional[RegimeLSTM] = None
         self.feature_columns = list(self.config.feature_columns)
         self.num_classes = len(STATE_NAMES)
+
+    def _compute_class_weights(self, counts: np.ndarray) -> torch.Tensor:
+        counts = counts.astype(np.float32)
+        counts[counts == 0] = counts[counts > 0].min() if (counts > 0).any() else 1.0
+        inv_freq = (counts.sum() / counts)
+        inv_pow = inv_freq ** self.config.class_weight_power
+        norm = inv_pow / inv_pow.mean()
+        return torch.tensor(norm, dtype=torch.float32)
 
     def _prepare_dataframe(self) -> pl.DataFrame:
         dataset = build_dataset(
@@ -256,7 +368,7 @@ class M002RegimeClassifier:
         seq_len: int,
         feature_cols: Sequence[str],
         label_col: str,
-    ) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    ) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame, np.ndarray]:
         sequences: List[np.ndarray] = []
         labels: List[int] = []
         meta: List[Tuple[str, pd.Timestamp]] = []
@@ -285,7 +397,8 @@ class M002RegimeClassifier:
         seq_array = seq_array[order]
         label_array = label_array[order]
         meta_df = meta_df.iloc[order].reset_index(drop=True)
-        return seq_array, label_array, meta_df
+        class_counts = np.bincount(label_array, minlength=self.num_classes)
+        return seq_array, label_array, meta_df, class_counts
 
     def train(self) -> Dict[str, float]:
         torch.manual_seed(self.config.random_seed)
@@ -309,7 +422,7 @@ class M002RegimeClassifier:
         print(f"Data validation passed: {X_check.shape[0]} samples, {X_check.shape[1]} features")
         print(f"Label distribution: {np.bincount(y_check.astype(int))}")
 
-        seq_array, label_array, meta_df = self._build_sequences(
+        seq_array, label_array, meta_df, class_counts = self._build_sequences(
             df_pd,
             seq_len=self.config.seq_len,
             feature_cols=self.feature_columns,
@@ -325,6 +438,8 @@ class M002RegimeClassifier:
 
         print(f"Sequence validation passed: {seq_array.shape[0]} sequences, shape {seq_array.shape}")
 
+        print(f"Sequence label distribution: {class_counts}")
+
         num_samples = seq_array.shape[0]
         split_idx = max(int(num_samples * (1 - self.config.valid_ratio)), 1)
         train_seq, valid_seq = seq_array[:split_idx], seq_array[split_idx:]
@@ -337,8 +452,23 @@ class M002RegimeClassifier:
         train_dataset = RegimeSequenceDataset(train_seq, train_lbl)
         valid_dataset = RegimeSequenceDataset(valid_seq, valid_lbl)
 
-        train_loader = DataLoader(train_dataset, batch_size=self.config.batch_size, shuffle=True, drop_last=False)
+        if self.config.balance_classes:
+            # Use balanced oversampling within each batch
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=self.config.batch_size,
+                shuffle=True,
+                drop_last=False,
+                collate_fn=lambda batch: balanced_collate_fn(batch, self.num_classes)
+            )
+        else:
+            train_loader = DataLoader(train_dataset, batch_size=self.config.batch_size, shuffle=True, drop_last=False)
+
         valid_loader = DataLoader(valid_dataset, batch_size=self.config.batch_size, shuffle=False, drop_last=False)
+
+        # Compute class weights for validation (training uses balanced batches)
+        train_counts = np.bincount(train_lbl, minlength=self.num_classes)
+        class_weights = self._compute_class_weights(train_counts)
 
         device = self.config.device()
         model = RegimeLSTM(
@@ -348,7 +478,11 @@ class M002RegimeClassifier:
             dropout=self.config.dropout,
             num_classes=self.num_classes,
         ).to(device)
-        criterion = nn.CrossEntropyLoss()
+        # When using balanced oversampling, don't use class weights since batches are already balanced
+        criterion = nn.CrossEntropyLoss(
+            weight=None,  # Balanced batches don't need class weights
+            label_smoothing=self.config.label_smoothing,
+        )
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=self.config.learning_rate,
@@ -451,6 +585,8 @@ class M002RegimeClassifier:
             "valid_loss": float(best_val_loss),
             "valid_accuracy": float(valid_acc),
             "n_sequences": int(num_samples),
+            "class_counts": class_counts.tolist(),
+            "class_weights": class_weights.cpu().numpy().tolist(),
         }
         return metrics
 
@@ -521,4 +657,4 @@ class M002RegimeClassifier:
         return merged_pl
 
 
-__all__ = ["RegimeConfig", "M002RegimeClassifier", "DEFAULT_REGIME_FEATURES"]
+__all__ = ["RegimeConfig", "M002RegimeClassifier", "DEFAULT_REGIME_FEATURES", "balanced_collate_fn"]
