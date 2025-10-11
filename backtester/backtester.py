@@ -903,32 +903,41 @@ def plot_signals_per_ticker(backtest_result: Dict[str, Any], show: bool = False,
                     ax.scatter(pos['date'], pos['close'], color='green', s=28, label='Signal (↑ or TP)')
                     # direction_proba와 event_proba 값 표시
                     for _, row in pos.iterrows():
-                        dir_prob = row.get('signal_trigger_prob', '')
-                        ev_prob = row.get('signal_event_prob', '')
-                        ax.annotate(f"D:{dir_prob:.2f}\nE:{ev_prob:.2f}", 
-                                  (row['date'], row['close']), 
-                                  xytext=(5, 5), textcoords='offset points', 
-                                  fontsize=7, color='green')
+                        try:
+                            dir_prob = float(row.get('signal_trigger_prob', 0))
+                            ev_prob = float(row.get('signal_event_prob', 0))
+                            ax.annotate(f"D:{dir_prob:.2f}\nE:{ev_prob:.2f}",
+                                      (row['date'], row['close']),
+                                      xytext=(5, 5), textcoords='offset points',
+                                      fontsize=7, color='green')
+                        except (ValueError, TypeError):
+                            pass  # 값이 유효하지 않으면 표시하지 않음
                 if not neg.empty:
                     ax.scatter(neg['date'], neg['close'], color='orange', s=28, label='Signal (↓)')
                     # direction_proba와 event_proba 값 표시
                     for _, row in neg.iterrows():
-                        dir_prob = row.get('signal_trigger_prob', '')
-                        ev_prob = row.get('signal_event_prob', '')
-                        ax.annotate(f"D:{dir_prob:.2f}\nE:{ev_prob:.2f}", 
-                                  (row['date'], row['close']), 
-                                  xytext=(5, -15), textcoords='offset points', 
-                                  fontsize=7, color='orange')
+                        try:
+                            dir_prob = float(row.get('signal_trigger_prob', 0))
+                            ev_prob = float(row.get('signal_event_prob', 0))
+                            ax.annotate(f"D:{dir_prob:.2f}\nE:{ev_prob:.2f}",
+                                      (row['date'], row['close']),
+                                      xytext=(5, -15), textcoords='offset points',
+                                      fontsize=7, color='orange')
+                        except (ValueError, TypeError):
+                            pass  # 값이 유효하지 않으면 표시하지 않음
             else:
                 ax.scatter(sig['date'], sig['close'], color='red', s=25, label='Signal Day')
                 # direction_proba와 event_proba 값 표시
                 for _, row in sig.iterrows():
-                    dir_prob = row.get('signal_trigger_prob', '')
-                    ev_prob = row.get('signal_event_prob', '')
-                    ax.annotate(f"D:{dir_prob:.2f}\nE:{ev_prob:.2f}", 
-                              (row['date'], row['close']), 
-                              xytext=(5, 5), textcoords='offset points', 
-                              fontsize=7, color='red')
+                    try:
+                        dir_prob = float(row.get('signal_trigger_prob', 0))
+                        ev_prob = float(row.get('signal_event_prob', 0))
+                        ax.annotate(f"D:{dir_prob:.2f}\nE:{ev_prob:.2f}",
+                                  (row['date'], row['close']),
+                                  xytext=(5, 5), textcoords='offset points',
+                                  fontsize=7, color='red')
+                    except (ValueError, TypeError):
+                        pass  # 값이 유효하지 않으면 표시하지 않음
 
         if is_tp_mode and 'open_next' in sub.columns and 'tp_price' in sub.columns:
             # 다음날 TP 레벨 보조 표기 (선택적인 참고용)

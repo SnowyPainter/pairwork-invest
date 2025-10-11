@@ -1,4 +1,5 @@
 # features/feature_sets.py
+import numpy as np
 import polars as pl
 
 def add_core_features(lf: pl.LazyFrame) -> pl.LazyFrame:
@@ -90,6 +91,30 @@ def _true_range() -> pl.Expr:
 
 def _safe_div(a: pl.Expr, b: pl.Expr, eps: float=1e-9) -> pl.Expr:
     return a / (b + eps)
+
+def _poly_second_derivative(values: np.ndarray) -> float:
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0 or np.all(~np.isfinite(arr)):
+        return np.nan
+
+    mask = np.isfinite(arr)
+    if mask.sum() < 5:
+        return np.nan
+
+    x = np.arange(mask.sum(), dtype=float)
+    y = arr[mask]
+
+    deg = min(3, int(mask.sum()) - 1)
+    if deg < 2:
+        return np.nan
+
+    try:
+        coeffs = np.polyfit(x, y, deg=deg)
+        second = np.polyder(coeffs, 2)
+        mid = x[len(x) // 2]
+        return float(np.polyval(second, mid))
+    except (np.linalg.LinAlgError, ValueError):
+        return np.nan
 
 # ==== v2 확장 ====
 def add_v2_features(lf: pl.LazyFrame) -> pl.LazyFrame:
@@ -488,6 +513,184 @@ def add_v3_features(lf: pl.LazyFrame) -> pl.LazyFrame:
         ])
     )
 
+def add_m002_features(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """
+    Feature block tailored for the M002 architecture.
+    Builds upon v3 features and injects event heuristics, curvature/slope metrics, and context signals.
+    """
+    g = "ticker"
+    curvature_window = 11
+
+    lf = add_v3_features(add_v2_features(add_core_features(lf)))
+
+    # Core derivatives and spreads
+    lf = lf.with_columns([
+        (pl.col("close") / pl.col("close").shift(1).over(g) - 1).alias("ret1"),
+        (pl.col("volume") / pl.col("volume").shift(1).over(g) - 1).alias("vol_roc1"),
+        (pl.col("rsi14") - pl.col("rsi14").shift(1).over(g)).alias("delta_rsi"),
+        (pl.col("rsi14") - pl.col("rsi14").shift(3).over(g)).alias("delta_rsi_3"),
+        (pl.col("macd_hist") - pl.col("macd_hist").shift(1).over(g)).alias("delta_macd"),
+        (pl.col("ema5") - pl.col("ema20")).alias("ema_spread"),
+        (pl.col("atr14") - pl.col("atr14").shift(1).over(g)).alias("delta_atr"),
+    ])
+
+    # Local volatility ratio
+    lf = lf.with_columns([
+        pl.col("ret1").rolling_std(5).over(g).alias("ret_std5"),
+        pl.col("ret1").rolling_std(20).over(g).alias("ret_std20"),
+    ])
+    lf = lf.with_columns([
+        _safe_div(pl.col("ret_std5"), pl.col("ret_std20")).alias("local_vol_index"),
+    ])
+
+    # Bollinger adaptions
+    lf = lf.with_columns([
+        pl.col("close").rolling_mean(20).over(g).alias("bb_mid"),
+        pl.col("close").rolling_std(20).over(g).alias("bb_std"),
+        (pl.col("close").rolling_mean(20).over(g) + 2 * pl.col("close").rolling_std(20).over(g)).alias("bb_upper"),
+        (pl.col("close").rolling_mean(20).over(g) - 2 * pl.col("close").rolling_std(20).over(g)).alias("bb_lower"),
+        ((pl.col("close").rolling_mean(20).over(g) + 2 * pl.col("close").rolling_std(20).over(g)) -
+         (pl.col("close").rolling_mean(20).over(g) - 2 * pl.col("close").rolling_std(20).over(g))).alias("bb_band_width"),
+    ])
+    lf = lf.with_columns([
+        _safe_div(pl.col("close") - pl.col("bb_mid"), pl.col("bb_band_width")).clip(0.0, 1.0).alias("pos_in_band_rel"),
+        _safe_div(pl.col("bb_band_width"), pl.col("bb_mid").abs()).alias("bb_width"),
+    ])
+
+    # Spread relatives and slopes
+    lf = lf.with_columns([
+        _safe_div(pl.col("ema_spread"), pl.col("ema20")).alias("ema_spread_rel"),
+        (pl.col("ema_spread") - pl.col("ema_spread").shift(1).over(g)).alias("delta_ema_spread"),
+    ])
+    lf = lf.with_columns([
+        (pl.col("ema_spread_rel") - pl.col("ema_spread_rel").shift(1).over(g)).alias("ema_spread_rel_slope"),
+    ])
+
+    # ATR relatives
+    lf = lf.with_columns([
+        _safe_div(pl.col("atr14"), pl.col("atr14").rolling_mean(20).over(g)).alias("atr_rel"),
+        _safe_div(pl.col("delta_atr"), pl.col("atr14").rolling_std(10).over(g)).alias("delta_atr_rel"),
+    ])
+    lf = lf.with_columns([
+        (pl.col("atr_rel") - pl.col("atr_rel").shift(1).over(g)).alias("atr_slope"),
+    ])
+
+    # Momentum smoothers
+    lf = lf.with_columns([
+        pl.col("vol_z20").alias("volume_z"),
+        (pl.col("ret1") - pl.col("ret1").shift(1).over(g)).alias("price_accel"),
+        pl.col("ret1").alias("price_slope"),
+        (pl.col("macd_signal") - pl.col("macd_signal").shift(1).over(g)).alias("macd_signal_slope"),
+    ])
+
+    # Normalised price for curvature measures
+    lf = lf.with_columns([
+        _safe_div(
+            pl.col("close") - pl.col("close").rolling_mean(20).over(g),
+            pl.col("close").rolling_std(20).over(g)
+        ).alias("close_norm"),
+    ])
+
+    lf = lf.with_columns([
+        pl.col("close_norm")
+        .rolling_map(lambda s: _poly_second_derivative(s.to_numpy()), window_size=curvature_window, min_periods=5)
+        .over(g)
+        .alias("curv_2")
+    ])
+
+    lf = lf.with_columns([
+        pl.col("rsi14").ewm_mean(alpha=2 / 6, adjust=False).over(g).alias("rsi_ewm"),
+        pl.col("macd_hist").ewm_mean(alpha=2 / 5, adjust=False).over(g).alias("macd_hist_ewm"),
+        pl.col("atr_rel").ewm_mean(alpha=2 / 4, adjust=False).over(g).alias("atr_rel_ewm"),
+        pl.col("volume_z").ewm_mean(alpha=2 / 5, adjust=False).over(g).alias("volume_z_ewm"),
+        pl.col("ema_spread_rel").ewm_mean(alpha=2 / 5, adjust=False).over(g).alias("ema_spread_rel_ewm"),
+    ])
+
+    lf = lf.with_columns([
+        pl.col("rsi_ewm").rolling_median(3).over(g).fill_null(pl.col("rsi_ewm")).alias("rsi_smooth"),
+        pl.col("macd_hist_ewm").rolling_mean(3).over(g).alias("macd_smooth"),
+        pl.col("atr_rel_ewm").rolling_mean(3).over(g).alias("atr_smooth"),
+        pl.col("volume_z_ewm").rolling_mean(3).over(g).alias("volume_z_smooth"),
+        pl.col("ema_spread_rel_ewm").rolling_mean(3).over(g).alias("ema_spread_smooth"),
+    ])
+
+    # Event heuristics
+    lf = lf.with_columns([
+        pl.when(pl.col("local_vol_index") > 1.5).then(1).otherwise(0).cast(pl.Int8).alias("event_local_vol_spike"),
+        pl.when(
+            (pl.col("pos_in_band_rel") < 0.35)
+            & (pl.col("delta_rsi_3") > 0)
+            & (pl.col("delta_macd") > 0)
+            & (pl.col("volume_z") > 0)
+        ).then(1).otherwise(0).cast(pl.Int8).alias("event_rebound_candidate"),
+        pl.when(
+            (pl.col("volume_z") > 0.8)
+            & (pl.col("vol_roc1") > 0)
+            & (pl.col("delta_rsi") > 0)
+        ).then(1).otherwise(0).cast(pl.Int8).alias("event_volume_regain"),
+        pl.when(
+            (pl.col("pos_in_band_rel") > 0.85)
+            & (pl.col("delta_ema_spread") < 0)
+            & (pl.col("delta_atr") > 0)
+            & (pl.col("volume_z") < 0.5)
+        ).then(1).otherwise(0).cast(pl.Int8).alias("event_exhaustion_candidate"),
+        pl.when(
+            (pl.col("local_vol_index") > 1.2)
+            & (pl.col("macd_hist") < 0)
+            & (pl.col("delta_rsi") < 0)
+        ).then(1).otherwise(0).cast(pl.Int8).alias("event_breakdown_risk"),
+    ])
+
+    lf = lf.with_columns([
+        (pl.col("event_volume_regain") & pl.col("event_local_vol_spike")).cast(pl.Int8).alias("I_vr_and_vs"),
+        (pl.col("event_breakdown_risk") & (pl.col("curv_2") < 0) & (pl.col("ema_spread_rel") < 0) & (pl.col("delta_rsi") < 0))
+        .cast(pl.Int8)
+        .alias("I_bd_early"),
+        (pl.col("event_breakdown_risk") & (pl.col("curv_2") > 0) & (pl.col("rsi14") < 40) & (pl.col("macd_signal_slope") > 0))
+        .cast(pl.Int8)
+        .alias("I_bd_late"),
+    ])
+
+    # Context metrics
+    lf = lf.with_columns([
+        pl.col("event_volume_regain").rolling_sum(20).over(g).alias("event_volume_regain_freq20"),
+        pl.col("event_breakdown_risk").rolling_sum(20).over(g).alias("event_breakdown_freq20"),
+        pl.col("event_local_vol_spike").rolling_sum(20).over(g).alias("event_local_vol_freq20"),
+    ])
+
+    lf = lf.with_columns([
+        pl.col("close").rolling_max(60).over(g).alias("recent_high_60"),
+        pl.col("close").rolling_min(60).over(g).alias("recent_low_60"),
+    ])
+
+    lf = lf.with_columns([
+        _safe_div(pl.col("close") - pl.col("recent_low_60"), pl.col("recent_low_60")).alias("recovery_from_low_60"),
+        _safe_div(pl.col("close") - pl.col("recent_high_60"), pl.col("recent_high_60")).alias("distance_from_high_60"),
+    ])
+
+    lf = lf.with_columns([
+        pl.when(pl.col("event_volume_regain") > 0).then(pl.col("date")).otherwise(None).alias("_last_vr_date"),
+        pl.when(pl.col("event_breakdown_risk") > 0).then(pl.col("date")).otherwise(None).alias("_last_bd_date"),
+    ])
+
+    lf = lf.with_columns([
+        pl.col("_last_vr_date").forward_fill().over(g).alias("_last_vr_ff"),
+        pl.col("_last_bd_date").forward_fill().over(g).alias("_last_bd_ff"),
+    ])
+
+    lf = lf.with_columns([
+        (pl.col("date") - pl.col("_last_vr_ff")).dt.total_days().cast(pl.Int32).fill_null(1_000).alias("days_since_volume_regain"),
+        (pl.col("date") - pl.col("_last_bd_ff")).dt.total_days().cast(pl.Int32).fill_null(1_000).alias("days_since_breakdown"),
+    ])
+
+    # Clean up temporary helpers
+    lf = lf.drop([
+        "ret_std5", "ret_std20", "_last_vr_date", "_last_bd_date", "_last_vr_ff", "_last_bd_ff", "rsi_ewm",
+        "macd_hist_ewm", "atr_rel_ewm", "volume_z_ewm", "ema_spread_rel_ewm"
+    ])
+
+    return lf
+
 def add_feature_set(lf: pl.LazyFrame, feature_set: str="v1") -> pl.LazyFrame:
     if feature_set == "v1":
         return add_core_features(lf)
@@ -495,5 +698,6 @@ def add_feature_set(lf: pl.LazyFrame, feature_set: str="v1") -> pl.LazyFrame:
         return add_v2_features(add_core_features(lf))
     if feature_set == "v3":
         return add_v3_features(add_v2_features(add_core_features(lf)))
-    raise ValueError(f"unknown feature_set: {feature_set}")
+    if feature_set == "m002":
+        return add_m002_features(lf)
     raise ValueError(f"unknown feature_set: {feature_set}")
