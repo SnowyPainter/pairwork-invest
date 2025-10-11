@@ -90,8 +90,8 @@ def _soft_policy_score(prob: np.ndarray, ret_pct: np.ndarray, dd_pct: np.ndarray
 
 @dataclass
 class PolicyConfig:
-    theta_long: float = 0.15
-    theta_flat_low: float = 0.05
+    theta_long: float = 0.05
+    theta_flat_low: float = 0.01
     theta_short: float = -0.1
     risk_aversion: float = 0.5
     size_k: float = 1.0
@@ -372,8 +372,12 @@ class M002FullArchitecture:
         if missing:
             raise ValueError(f"Missing required feature columns for prediction: {missing}")
 
+        # 정책 적용에 필요한 컬럼들도 포함 (중복 제거)
+        needed_for_policy = {"atr_smooth", "I_vr_and_vs", "I_bd_late", "I_bd_early", "state_prob_Peak"}
+        cols_to_select = list(set(["ticker", "date"] + list(self.head_features) + list(needed_for_policy)))
+
         pdf = (
-            df.select(["ticker", "date", *self.head_features])
+            df.select(cols_to_select)
               .to_pandas()
               .replace([np.inf, -np.inf], np.nan)
               .fillna(0.0)
@@ -393,8 +397,7 @@ class M002FullArchitecture:
             self.policy_cfg.risk_aversion,
         )
 
-        # Need 'atr_smooth' and a few indicator columns for policy; if missing, fill 0
-        needed_for_policy = {"atr_smooth", "I_vr_and_vs", "I_bd_late", "I_bd_early", "state_prob_Peak"}
+        # 정책 컬럼이 여전히 없는 경우에만 0으로 채움
         for col in needed_for_policy - set(pdf.columns):
             pdf[col] = 0.0
 
@@ -411,7 +414,6 @@ def main() -> Dict[str, Dict[str, float]]:
     only if verbose=True in the config. Returns metrics dict.
     """
     config = FullArchitectureConfig()  # set verbose=True if you want minimal logs
-    config.multitask.years = [2019]  # 2019년 데이터만 사용
     model = M002FullArchitecture(config=config)
     metrics = model.train()
 

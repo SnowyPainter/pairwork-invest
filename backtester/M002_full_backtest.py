@@ -6,7 +6,6 @@ M002 Full Architecture 백테스트 (backtesting.py 기반, 병렬 처리 포함
 - 모델: M002FullArchitecture (predict(df: pl.DataFrame) -> dict)
 - 데이터: build_dataset(...) 로 로드 (polars DataFrame)
 - 시그널: 모델 예측으로부터 Action(LONG/SHORT/FLAT), Policy Score 등 생성
-- 상위 N개/일 필터: abs(policy_score) 기준으로 날짜별 top-N만 거래 (다른 종목은 해당일 FLAT)
 - per-ticker 백테스트: backtesting.py로 개별 실행, 종목별 HTML 차트 저장
 - 결과: 종목별 통계 stats 집계 -> CSV 저장
 
@@ -75,8 +74,6 @@ class M002FullStrategy(Strategy):
             # HOLD 상태 — 아무것도 하지 않음
             pass
 
-
-
 # =========================
 # Backtester
 # =========================
@@ -84,14 +81,12 @@ class M002FullBacktester:
     def __init__(
         self,
         model: M002FullArchitecture,
-        top_n_signals: int = 20,
         commission: float = 0.001,
         initial_cash: float = 10_000,
         n_jobs: int = 8,                # 병렬 작업 수
         max_charts: int = 100           # HTML 차트 저장 최대 종목 수 (과도한 파일 생성 방지)
     ):
         self.model = model
-        self.top_n_signals = top_n_signals
         self.commission = commission
         self.initial_cash = initial_cash
         self.n_jobs = n_jobs
@@ -163,6 +158,24 @@ class M002FullBacktester:
         if len(acg_data) > 0:
             print(acg_data.select(["ticker", "date", "close", "volume"]).to_pandas())
 
+        # I_bd_early 등의 컬럼 존재 여부 확인
+        indicator_cols = ["I_bd_early", "I_bd_late", "I_vr_and_vs", "atr_smooth"]
+        print(f"\n[인디케이터 컬럼 확인]:")
+        for col in indicator_cols:
+            exists = col in df.columns
+            print(f"  {col}: {'있음' if exists else '없음'}")
+            if exists:
+                # 값 분포 확인
+                unique_vals = df[col].unique().to_list()
+                print(f"    고유값: {unique_vals[:10]}..." if len(unique_vals) > 10 else f"    고유값: {unique_vals}")
+
+        # AAWW 티커의 인디케이터 값 확인
+        if "AAWW" in df["ticker"].unique():
+            aaww_data = df.filter(pl.col("ticker") == "AAWW").head(5)
+            print(f"\n[AAWW 인디케이터 값]:")
+            cols_to_show = ["ticker", "date", "close"] + [c for c in indicator_cols if c in df.columns]
+            print(aaww_data.select(cols_to_show).to_pandas())
+
         pred = self.model.predict(df)
         
         print(f"\n[예측 결과 디버그]")
@@ -190,28 +203,15 @@ class M002FullBacktester:
             pl.Series("expected_return", pred["pred_expected_ret_pct"]),
         ])
 
-        # 날짜별 abs(policy_score) top-N 이외는 FLAT 처리
-        df_ranked = (
-            df_pred
-            .with_columns(
-                pl.col("policy_score").abs()
-                .rank("dense", descending=True)
-                .over("date")
-                .alias("abs_rank")
-            )
-            .with_columns(
-                pl.when(pl.col("abs_rank") <= self.top_n_signals)
-                .then(pl.col("action_raw"))
-                .otherwise(pl.lit("FLAT"))
-                .alias("action")
-            )
-            .drop("abs_rank")
+        # Top-N 필터링 제거 - 모든 종목을 동시에 거래
+        df_ranked = df_pred.with_columns(
+            pl.col("action_raw").alias("action")
         )
 
         # 액션 분포 출력
         stats = df_ranked.group_by("action").agg(pl.len().alias("count")).sort("count", descending=True)
         total = len(df_ranked)
-        print("  Action 분포(Top-N 적용 후):")
+        print("  Action 분포:")
         for a, c in stats.iter_rows():
             print(f"    {a:>5}: {c:,} ({c/total:.1%})")
 
@@ -377,7 +377,6 @@ def main():
     # 백테스터 실행
     backtester = M002FullBacktester(
         model=model,
-        top_n_signals=100,
         commission=0.0025,
         initial_cash=10_000,
         n_jobs=64,
