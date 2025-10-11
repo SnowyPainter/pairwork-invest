@@ -97,12 +97,12 @@ def _assign_regime_labels(df: pl.DataFrame) -> pl.DataFrame:
 @dataclass
 class RegimeConfig:
     feature_columns: Sequence[str] = field(default_factory=lambda: DEFAULT_REGIME_FEATURES)
-    seq_len: int = 30
-    hidden_size: int = 64
+    seq_len: int = 20
+    hidden_size: int = 128
     num_layers: int = 2
-    dropout: float = 0.1
+    dropout: float = 0.2
     batch_size: int = 128
-    max_epochs: int = 15
+    max_epochs: int = 30
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     valid_ratio: float = 0.2

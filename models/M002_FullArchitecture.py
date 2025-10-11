@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Sequence, Tuple, List
 
@@ -90,14 +91,14 @@ def _soft_policy_score(prob: np.ndarray, ret_pct: np.ndarray, dd_pct: np.ndarray
 
 @dataclass
 class PolicyConfig:
-    theta_long: float = 0.05
+    theta_long: float = 0.01
     theta_flat_low: float = 0.0
-    theta_short: float = -0.05
+    theta_short: float = -0.01
     risk_aversion: float = 0.45
     size_k: float = 1.0
     size_max: float = 1.0
     ex_ante_vol_window: int = 10
-    restrict_short_on_peak_prob: float = 0.4
+    restrict_short_on_peak_prob: float = 0.3
     rescale_window: int = 60
     score_scale: float = 2.5
     use_rescaled_score: bool = True
@@ -187,33 +188,21 @@ class M002FullArchitecture:
 
     # ---------- Training ----------
 
-    def train(self) -> Dict[str, Dict[str, float]]:
-        """Train regime classifier + head models. Returns validation metrics."""
-        if self.config.verbose:
-            print("[A] Training regime classifier ...")
-        regime_metrics = self.regime.train()
-
-        if self.config.verbose:
-            print("[B] Preparing head dataset ...")
+    def _prepare_head_dataset(self) -> Dict[str, pd.DataFrame]:
         df = self._load_base_dataframe()
-
-        # Join state probabilities
         state_probs = self.regime.predict_probabilities(
             df.select(["ticker", "date", *DEFAULT_REGIME_FEATURES])
         )
         df = df.join(state_probs, on=["ticker", "date"], how="left")
 
-        # Keep NaNs: LightGBM handles feature NaNs; targets must be finite.
         ret_col = f"ret_{self.config.horizon}d_pct"
         dd_col = f"dd_{self.config.horizon}d_pct"
 
-        # Filter to available features only (robust to missing columns)
         available_cols = set(df.columns)
         available_head_features: List[str] = [f for f in self.head_features if f in available_cols]
         if not available_head_features:
             raise ValueError("No head features available in the dataset after join.")
 
-        # Build pandas frame
         use_cols = ["ticker", "date", "label_rebound_bin", ret_col, dd_col, *available_head_features]
         df_pd = (
             df.select(use_cols)
@@ -221,11 +210,9 @@ class M002FullArchitecture:
               .replace([np.inf, -np.inf], np.nan)
         )
 
-        # Targets cannot be NaN for sklearn
-        yreg = df_pd[[ret_col, dd_col]]
-        target_mask = yreg.notna().all(axis=1)
-        df_pd = df_pd.loc[target_mask].reset_index(drop=True)
-
+        targets = df_pd[[ret_col, dd_col]]
+        mask = targets.notna().all(axis=1)
+        df_pd = df_pd.loc[mask].reset_index(drop=True)
         if df_pd.empty:
             raise ValueError("No valid samples after removing NaN targets.")
 
@@ -233,18 +220,27 @@ class M002FullArchitecture:
         y_cls = df_pd["label_rebound_bin"].astype(int)
         y_reg = df_pd[[ret_col, dd_col]]
 
-        # Simple time-order split
         n = len(X)
         split_idx = max(int(n * 0.8), 1)
         X_train, X_valid = X.iloc[:split_idx], X.iloc[split_idx:]
         y_cls_train, y_cls_valid = y_cls.iloc[:split_idx], y_cls.iloc[split_idx:]
         y_reg_train, y_reg_valid = y_reg.iloc[:split_idx], y_reg.iloc[split_idx:]
 
-        if X_valid.empty:  # tiny dataset fallback
+        if X_valid.empty:
             X_valid, y_cls_valid, y_reg_valid = X_train.copy(), y_cls_train.copy(), y_reg_train.copy()
 
-        # LightGBM params
-        clf_params = dict(
+        return {
+            "X_train": X_train,
+            "X_valid": X_valid,
+            "y_cls_train": y_cls_train,
+            "y_cls_valid": y_cls_valid,
+            "y_reg_train": y_reg_train,
+            "y_reg_valid": y_reg_valid,
+            "available_head_features": tuple(available_head_features),
+        }
+
+    def _default_head_params(self) -> Dict[str, Dict]:
+        base = dict(
             objective="binary",
             metric="binary_logloss",
             learning_rate=0.05,
@@ -257,7 +253,7 @@ class M002FullArchitecture:
             reg_lambda=0.3,
             random_state=self.config.multitask.random_state,
         )
-        reg_params = dict(
+        reg = dict(
             objective="regression",
             metric="l1",
             learning_rate=0.05,
@@ -270,26 +266,42 @@ class M002FullArchitecture:
             reg_lambda=0.2,
             random_state=self.config.multitask.random_state,
         )
+        return {"clf": base, "reg": reg}
 
-        # Train classifier
-        self.head_model = lgb.LGBMClassifier(**clf_params)
-        self.head_model.fit(
+    def _fit_head_models(
+        self,
+        data: Dict[str, pd.DataFrame],
+        clf_params: Dict,
+        reg_params: Dict,
+        store_model: bool = True,
+    ) -> Dict[str, float]:
+        X_train = data["X_train"]
+        X_valid = data["X_valid"]
+        y_cls_train = data["y_cls_train"]
+        y_cls_valid = data["y_cls_valid"]
+        y_reg_train = data["y_reg_train"]
+        y_reg_valid = data["y_reg_valid"]
+
+        head_model = lgb.LGBMClassifier(**clf_params)
+        head_model.fit(
             X_train,
             y_cls_train,
             eval_set=[(X_valid, y_cls_valid)],
             callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)],
         )
 
-        # Train multi-output regressor
         base_reg = lgb.LGBMRegressor(**reg_params)
-        self.head_multi = MultiOutputRegressor(base_reg)
-        self.head_multi.fit(X_train, y_reg_train)
+        head_multi = MultiOutputRegressor(base_reg)
+        head_multi.fit(X_train, y_reg_train)
 
-        # Metrics
+        if store_model:
+            self.head_model = head_model
+            self.head_multi = head_multi
+
         from sklearn.metrics import average_precision_score, mean_absolute_error
 
-        prob_valid = self.head_model.predict_proba(X_valid)[:, 1]
-        reg_valid = self.head_multi.predict(X_valid)
+        prob_valid = head_model.predict_proba(X_valid)[:, 1]
+        reg_valid = head_multi.predict(X_valid)
         ret_pred_valid, dd_pred_valid = reg_valid[:, 0], reg_valid[:, 1]
         policy_scores = _soft_policy_score(
             prob_valid, ret_pred_valid, dd_pred_valid, self.policy_cfg.risk_aversion
@@ -301,9 +313,110 @@ class M002FullArchitecture:
             "valid_mae_dd": float(mean_absolute_error(y_reg_valid.iloc[:, 1], dd_pred_valid)),
             "valid_policy_mean": float(np.nanmean(policy_scores)),
         }
+        return head_metrics
 
-        self.head_features = tuple(available_head_features)
-        self.trained_state = {"regime_metrics": regime_metrics, "head_metrics": head_metrics}
+    def tune_head_hyperparams(
+        self,
+        n_trials: int = 40,
+        timeout: Optional[int] = None,
+        sampler: str = "tpe",
+    ) -> Dict[str, Dict]:
+        """AutoML-style tuning of LightGBM head via Optuna."""
+        try:  # pragma: no cover - optional dependency
+            import optuna
+        except ImportError as exc:
+            raise ImportError(
+                "Optuna is required for hyperparameter tuning. Install with `pip install optuna`."
+            ) from exc
+
+        data = self._prepare_head_dataset()
+        self.head_features = data["available_head_features"]
+        defaults = self._default_head_params()
+
+        sampler_obj = (
+            optuna.samplers.RandomSampler()
+            if sampler.lower() == "random"
+            else optuna.samplers.TPESampler()
+        )
+
+        study = optuna.create_study(direction="maximize", sampler=sampler_obj)
+
+        def objective(trial: optuna.Trial) -> float:
+            clf_params = deepcopy(defaults["clf"])
+            reg_params = deepcopy(defaults["reg"])
+
+            clf_params.update(
+                learning_rate=trial.suggest_float("clf_learning_rate", 0.01, 0.2, log=True),
+                num_leaves=trial.suggest_int("clf_num_leaves", 63, 255),
+                feature_fraction=trial.suggest_float("clf_feature_fraction", 0.6, 1.0),
+                bagging_fraction=trial.suggest_float("clf_bagging_fraction", 0.6, 1.0),
+                bagging_freq=trial.suggest_int("clf_bagging_freq", 1, 10),
+                n_estimators=trial.suggest_int("clf_n_estimators", 300, 900),
+                reg_alpha=trial.suggest_float("clf_reg_alpha", 1e-3, 1.0, log=True),
+                reg_lambda=trial.suggest_float("clf_reg_lambda", 1e-3, 1.0, log=True),
+                min_child_samples=trial.suggest_int("clf_min_child_samples", 10, 80),
+            )
+
+            reg_params.update(
+                learning_rate=trial.suggest_float("reg_learning_rate", 0.01, 0.2, log=True),
+                num_leaves=trial.suggest_int("reg_num_leaves", 63, 255),
+                feature_fraction=trial.suggest_float("reg_feature_fraction", 0.6, 1.0),
+                bagging_fraction=trial.suggest_float("reg_bagging_fraction", 0.6, 1.0),
+                bagging_freq=trial.suggest_int("reg_bagging_freq", 1, 10),
+                n_estimators=trial.suggest_int("reg_n_estimators", 400, 1000),
+                reg_alpha=trial.suggest_float("reg_reg_alpha", 1e-3, 1.0, log=True),
+                reg_lambda=trial.suggest_float("reg_reg_lambda", 1e-3, 1.0, log=True),
+                min_child_samples=trial.suggest_int("reg_min_child_samples", 10, 80),
+            )
+
+            metrics = self._fit_head_models(data, clf_params, reg_params, store_model=False)
+            score = metrics["valid_avg_precision"] + 0.1 * metrics["valid_policy_mean"]
+            trial.set_user_attr("metrics", metrics)
+            return score
+
+        study.optimize(objective, n_trials=n_trials, timeout=timeout)
+
+        best_trial = study.best_trial
+        best_metrics = best_trial.user_attrs.get("metrics", {})
+
+        merged_clf = deepcopy(defaults["clf"])
+        merged_reg = deepcopy(defaults["reg"])
+        merged_clf.update({k.replace("clf_", ""): v for k, v in best_trial.params.items() if k.startswith("clf_")})
+        merged_reg.update({k.replace("reg_", ""): v for k, v in best_trial.params.items() if k.startswith("reg_")})
+
+        self.best_head_params = {"clf": merged_clf, "reg": merged_reg}
+        self.best_head_metrics = best_metrics
+        self.best_head_study = study
+
+        if self.config.verbose:
+            print(f"[TUNE] Best objective: {best_trial.value:.6f}")
+            print("[TUNE] Metrics:", best_metrics)
+
+        return {
+            "best_params": self.best_head_params,
+            "best_metrics": best_metrics,
+            "best_value": best_trial.value,
+        }
+
+    def train(self) -> Dict[str, Dict[str, float]]:
+        """Train regime classifier + head models. Returns validation metrics."""
+        if self.config.verbose:
+            print("[A] Training regime classifier ...")
+        regime_metrics = self.regime.train()
+
+        if self.config.verbose:
+            print("[B] Preparing head dataset ...")
+        data = self._prepare_head_dataset()
+        self.head_features = data["available_head_features"]
+
+        params = getattr(self, "best_head_params", None)
+        if params is None:
+            params = self._default_head_params()
+
+        head_metrics = self._fit_head_models(data, params["clf"], params["reg"])
+
+        self.head_features = data["available_head_features"]
+        self.trained_state = {"regime_metrics": regime_metrics, "head_metrics": head_metrics, "head_params": params}
         return self.trained_state
 
     # ---------- Policy ----------
