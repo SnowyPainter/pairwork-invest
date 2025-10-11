@@ -23,10 +23,14 @@
 
 ## 2. 1계층: Regime Classifier (상태/국면 추정)
 
-### 2.1 라벨링 (models/M002_RegimeClassifier.py:18)
+### 2.1 라벨링 (models/M002_RegimeClassifier.py:93)
 - `_assign_regime_labels()`:
-  - `I_bd_late` → LateDown, `event_exhaustion_candidate`/`event_breakdown_risk` → Peak 등 도메인 규칙을 if-else 체인으로 구현.
-  - `polars.when().then()` 체인으로 `regime_state` 문자열 생성 → `STATE_TO_ID` 매핑으로 Int 라벨 (`regime_state_id`).
+  - **우선순위 기반 병렬 평가**: 겹치는 이벤트가 많을 때 순서 의존성 제거.
+  - 각 상태별 조건을 개별적으로 평가 후 우선순위 점수 부여:
+    - Peak(5), Accumulation(4), EarlyUp(3), LateDown(2), Distribution(1)
+  - `polars.when().then()`으로 각 상태의 점수 계산 → `pl.struct()`와 `map_elements()`로 최대 점수 상태 선택.
+  - `STATE_TO_ID` 매핑으로 Int 라벨 (`regime_state_id`) 생성.
+  - **조건 완화**: 엄격한 threshold를 완화하여 클래스 균형 개선 (예: curv_2 > -0.5, rsi_smooth > 40 등).
 
 ### 2.2 시퀀스 구축
 - `_prepare_dataframe()`:
@@ -34,20 +38,23 @@
   - 티커별 정렬 후 `fill_null(forward)`로 feature 누락값 보정.
   - `_assign_regime_labels()` 적용, 유효 샘플만 필터링.
 - `_build_sequences()`:
-  - `pandas`로 변환 후, 티커별 30일(window) 슬라이딩 → `(N, 30, feature_dim)` numpy 배열과 라벨 vector 생성.
+  - `pandas`로 변환 후, 티커별 20일(window) 슬라이딩 → `(N, 20, feature_dim)` numpy 배열과 라벨 vector 생성.
 
 ### 2.3 LSTM 학습
 - `RegimeLSTM`: PyTorch `nn.LSTM` + FC layer.
 - `RegimeSequenceDataset`으로 시퀀스/라벨을 `DataLoader`에 공급.
+- **균형 배치 샘플링**: 희소 클래스의 gradient variance 문제를 해결하기 위해 `balanced_collate_fn()` 적용.
+  - 각 배치 내에서 클래스별 oversampling: 소수 클래스를 repetition으로 균형 맞춤.
+  - `WeightedRandomSampler` 대신 배치 수준 균형으로 학습 안정성 향상.
 - `train()`:
-  - AdamW, CrossEntropyLoss, max_epochs=15.
+  - AdamW, CrossEntropyLoss (weight=None, label_smoothing=0.15), max_epochs=15.
   - 최적 validation loss snapshot 저장.
   - 반환: train/valid loss, accuracy, 시퀀스 수.
 
 ### 2.4 추론
 - `predict_probabilities(pl.DataFrame)`:
   - 입력 DataFrame을 티커별 정렬, feature null 제거.
-  1. 티커 기준으로 연속 구간 확보 → seq_len 미만 구간은 패스.
+  1. 티커 기준으로 연속 구간 확보 → 20일(seq_len) 미만 구간은 패스.
   2. 각 window를 tensor로 변환 후 softmax.
   3. 원래 date index에 맞춰 state_prob_* 컬럼 생성 → `pl.DataFrame` 반환.
 
@@ -115,9 +122,10 @@ Raw OHLCV ──> build_dataset(feature_set="m002") ──> add_m002_features (P
    │                                       │
    │ feed                                 └> rich features w/ event flags, curvature, context
    ▼
-RegimeClassifier (LSTM) ──> state_prob_* ─┐
-                                          │ join
-                                          ▼
+RegimeClassifier (LSTM w/ balanced batch sampling) ──> state_prob_* ─┐
+   │ (priority-based labeling, oversampling)                         │ join
+   ▼                                                                 ▼
+   └─> regime_state_id ──> sequences ──> LSTM training ─────────────┘
 LightGBM Head (P_up, E_ret, E_dd) ──> PolicyScore ──> Policy Layer
                                                           │
                                                           └> action, size, score, supporting columns
@@ -131,10 +139,12 @@ LightGBM Head (P_up, E_ret, E_dd) ──> PolicyScore ──> Policy Layer
 
 ## 6. 확장 포인트
 
-- Regime 라벨링을 Heuristic → Semi-supervised or HMM 기반으로 대체 가능.
-- LightGBM Multi-task 대신 XGBoost, TabNet 등 실험.
-- Policy 파라미터(θ, λ, k) 자동 최적화 (Bayesian Optimization) 및 Cooldown/포트폴리오 리스크 조정 로직 추가.
-- 상태 확률을 `features/M002_FeatureExplorer.py`에서 시각화하여 모델 해석/품질 모니터링.
+- **데이터 샘플링 전략**: 현재 `balanced_collate_fn` 기반 oversampling 외에 SMOTE, ADASYN 등 고급 샘플링 기법 실험.
+- **라벨링 개선**: 우선순위 기반 → Semi-supervised (pseudo-labeling) or HMM 기반 상태 추정으로 발전.
+- **모델 아키텍처**: LightGBM Multi-task 대신 XGBoost, TabNet, Transformer 기반 시퀀스 모델 실험.
+- **학습 안정화**: curriculum learning (쉬운 샘플부터 어려운 샘플로) 또는 focal loss로 클래스 불균형 추가 대응.
+- **Policy 튜닝**: 파라미터(θ, λ, k) 자동 최적화 (Bayesian Optimization) 및 Cooldown/포트폴리오 리스크 조정 로직 추가.
+- **모니터링**: 상태 확률을 `features/M002_FeatureExplorer.py`에서 시각화하여 모델 해석/품질 모니터링.
 
 ---
 
