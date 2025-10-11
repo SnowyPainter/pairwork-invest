@@ -838,39 +838,47 @@ class M002FeatureExplorer:
 
         df["event_local_vol_spike"] = (df["local_vol_index"] > 1.5).astype(float)
 
-        if self.mode == "buyer":
-            df["event_rebound_candidate"] = (
-                (df["pos_in_band"] < 0.35)
-                & (df["delta_rsi_3"] > 0)
-                & (df["delta_macd"] > 0)
-                & (df["volume_z"] > 0)
-            ).astype(float)
-            df["event_volume_regain"] = (
-                (df["volume_z"] > 0.8)
-                & (df["vol_roc"] > 0)
-                & (df["delta_rsi"] > 0)
-            ).astype(float)
-        else:
-            df["event_exhaustion_candidate"] = (
-                (df["pos_in_band"] > 0.85)
-                & (df["delta_ema_spread"] < 0)
-                & (df["delta_atr_5"] > 0)
-                & (df["volume_z"] < 0.5)
-            ).astype(float)
-            df["event_breakdown_risk"] = (
-                (df["local_vol_index"] > 1.2)
-                & (df["macd_hist"] < 0)
-                & (df["delta_rsi"] < 0)
-            ).astype(float)
+        # Compute ALL events regardless of mode (for comprehensive analysis)
+        # Buyer events
+        df["event_rebound_candidate"] = (
+            (df["pos_in_band"] < 0.35)
+            & (df["delta_rsi_3"] > 0)
+            & (df["delta_macd"] > 0)
+            & (df["volume_z"] > 0)
+        ).astype(float)
 
-        # Ensure mode-opposite event columns exist for downstream smoothing
-        for missing_event in ("event_rebound_candidate", "event_volume_regain", "event_exhaustion_candidate", "event_breakdown_risk"):
-            if missing_event not in df.columns:
-                df[missing_event] = 0.0
+        df["event_volume_regain"] = (
+            (df["volume_z"] > 0.8)
+            & (df["vol_roc"] > 0)
+            & (df["delta_rsi"] > 0)
+        ).astype(float)
 
-        # Local episode assignment around events for normalization
-        event_columns = self._mode_event_columns()
-        episode_id, episode_label = self._build_local_episodes(df, event_columns)
+        # Seller events
+        df["event_exhaustion_candidate"] = (
+            (df["pos_in_band"] > 0.85)
+            & (df["delta_ema_spread"] < 0)
+            & (df["delta_atr_5"] > 0)
+            & (df["volume_z"] < 0.5)
+        ).astype(float)
+
+        df["event_breakdown_risk"] = (
+            (df["local_vol_index"] > 1.2)
+            & (df["macd_hist"] < 0)
+            & (df["delta_rsi"] < 0)
+        ).astype(float)
+
+        # Add local_vol_spike event (common to both modes)
+        df["event_local_vol_spike"] = (df["local_vol_index"] > 1.5).astype(float)
+
+        # Local episode assignment around ALL events for normalization
+        all_event_columns = [
+            "event_local_vol_spike",
+            "event_rebound_candidate",
+            "event_volume_regain",
+            "event_exhaustion_candidate",
+            "event_breakdown_risk"
+        ]
+        episode_id, episode_label = self._build_local_episodes(df, all_event_columns)
         df["local_episode_id"] = episode_id
         df["local_episode_label"] = episode_label
 
@@ -1229,29 +1237,21 @@ def generate_combined_visualizations(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    print(f"Generating combined buyer/seller visualizations for {len(tickers)} tickers...")
+    print(f"Generating combined all-events visualizations for {len(tickers)} tickers...")
 
-    # Create both buyer and seller explorers
-    buyer_explorer = M002FeatureExplorer(
+    # Create single explorer with all events
+    explorer = M002FeatureExplorer(
         tickers=tickers,
         start=start,
         end=end,
-        mode="buyer",
-        **kwargs
-    )
-    seller_explorer = M002FeatureExplorer(
-        tickers=tickers,
-        start=start,
-        end=end,
-        mode="seller",
+        mode="buyer",  # mode doesn't matter now, all events are calculated
         **kwargs
     )
 
-    # Build features for both
-    buyer_features = buyer_explorer.build_features()
-    seller_features = seller_explorer.build_features()
+    # Build features (all events included)
+    features = explorer.build_features()
 
-    print(f"Built features for buyer ({len(buyer_features)} rows) and seller ({len(seller_features)} rows)")
+    print(f"Built features with all events ({len(features)} rows)")
 
     # Generate visualizations for each ticker
     for ticker in tickers:
@@ -1259,17 +1259,16 @@ def generate_combined_visualizations(
         print(f"Processing combined view for {ticker_upper}...")
 
         try:
-            # Create combined event comparison chart
+            # Create combined event chart with all events
             fig = _create_combined_event_chart(
-                ticker_upper, buyer_features, seller_features,
-                buyer_explorer, seller_explorer
+                ticker_upper, features, explorer
             )
-            fig.write_html(str(output_path / f"{ticker_upper}_combined_events.html"))
-            print(f"  ✓ Saved combined event chart for {ticker_upper}")
+            fig.write_html(str(output_path / f"{ticker_upper}_all_events.html"))
+            print(f"  ✓ Saved all events chart for {ticker_upper}")
 
             # Create local episode visualization
             fig_episodes = _create_episode_visualization(
-                ticker_upper, buyer_features, seller_features
+                ticker_upper, features
             )
             fig_episodes.write_html(str(output_path / f"{ticker_upper}_episodes.html"))
             print(f"  ✓ Saved episode visualization for {ticker_upper}")
@@ -1279,19 +1278,20 @@ def generate_combined_visualizations(
             continue
 
     # Extract and save episode information
-    episode_data = extract_episode_data(tickers, buyer_features, seller_features)
+    episode_data = extract_episode_data(tickers, features)
 
     # Save combined metadata
     combined_info = {
         "tickers": tickers,
         "date_range": f"{start} to {end or 'latest'}",
-        "modes": ["buyer", "seller"],
-        "buyer_events": buyer_explorer._mode_event_columns(),
-        "seller_events": seller_explorer._mode_event_columns(),
-        "total_rows": {
-            "buyer": len(buyer_features),
-            "seller": len(seller_features)
-        },
+        "all_events": [
+            "event_local_vol_spike",
+            "event_rebound_candidate",
+            "event_volume_regain",
+            "event_exhaustion_candidate",
+            "event_breakdown_risk"
+        ],
+        "total_rows": len(features),
         "episode_summary": episode_data["summary"]
     }
 
@@ -1306,10 +1306,21 @@ def generate_combined_visualizations(
     print(f"✓ Completed combined visualizations. Files saved to {output_path}")
     print(f"✓ Episode data saved: {len(episode_data['detailed']['episodes'])} episodes found")
 
+    # Automatically run episode analysis
+    print("\n🚀 Running automatic episode analysis...")
+    try:
+        from features.analyze_m002_episodes import main as analyze_main
+        analyze_main()
+        print("✓ Episode analysis completed!")
+    except Exception as e:
+        print(f"✗ Episode analysis failed: {e}")
 
-def extract_episode_data(tickers: Sequence[str], buyer_df: pd.DataFrame, seller_df: pd.DataFrame) -> Dict[str, Any]:
+    print(f"\n🎉 All processing complete! Check {output_path} for results.")
+
+
+def extract_episode_data(tickers: Sequence[str], features_df: pd.DataFrame) -> Dict[str, Any]:
     """
-    Extract detailed episode information from buyer and seller feature dataframes.
+    Extract detailed episode information from combined feature dataframe.
 
     Returns:
         dict with 'summary' and 'detailed' keys containing episode statistics and details.
@@ -1317,56 +1328,53 @@ def extract_episode_data(tickers: Sequence[str], buyer_df: pd.DataFrame, seller_
     episodes = []
     summary_stats = {
         "total_episodes": 0,
-        "by_mode": {"buyer": 0, "seller": 0},
         "by_event_type": {},
         "by_ticker": {},
-        "avg_episode_length": {"buyer": 0, "seller": 0},
-        "episode_lengths": {"buyer": [], "seller": []}
+        "avg_episode_length": 0,
+        "episode_lengths": []
     }
 
     # Process each ticker
     for ticker in tickers:
-        ticker_buyer = buyer_df[buyer_df["ticker"] == ticker].copy()
-        ticker_seller = seller_df[seller_df["ticker"] == ticker].copy()
+        ticker_data = features_df[features_df["ticker"] == ticker].copy()
 
-        if ticker_buyer.empty or ticker_seller.empty:
+        if ticker_data.empty:
             continue
 
-        summary_stats["by_ticker"][ticker] = {"buyer": 0, "seller": 0}
+        summary_stats["by_ticker"][ticker] = 0
 
-        # Extract episodes for both modes
-        for df, mode_name in [(ticker_buyer, "buyer"), (ticker_seller, "seller")]:
-            episode_ids = df["local_episode_id"].unique()
-            episode_ids = episode_ids[episode_ids >= 0]  # Exclude -1 (no episode)
+        # Extract episodes
+        episode_ids = ticker_data["local_episode_id"].unique()
+        episode_ids = episode_ids[episode_ids >= 0]  # Exclude -1 (no episode)
 
-            for episode_id in episode_ids:
-                episode_mask = df["local_episode_id"] == episode_id
-                episode_data = df[episode_mask].copy()
+        for episode_id in episode_ids:
+            episode_mask = ticker_data["local_episode_id"] == episode_id
+            episode_data = ticker_data[episode_mask].copy()
 
-                if episode_data.empty:
-                    continue
+            if episode_data.empty:
+                continue
 
-                # Episode basic info
-                episode_label = episode_data["local_episode_label"].iloc[0]
-                start_date = episode_data["date"].min()
-                end_date = episode_data["date"].max()
-                duration = len(episode_data)
+            # Episode basic info
+            episode_label = episode_data["local_episode_label"].iloc[0]
+            start_date = episode_data["date"].min()
+            end_date = episode_data["date"].max()
+            duration = len(episode_data)
 
-                # Extract event type from label
-                event_type = episode_label.split(":")[0] if ":" in episode_label else episode_label
+            # Extract event type from label
+            event_type = episode_label.split(":")[0] if ":" in episode_label else episode_label
 
-                # Calculate episode statistics
-                price_change = (episode_data["close"].iloc[-1] - episode_data["close"].iloc[0]) / episode_data["close"].iloc[0] * 100
-                max_price_change = ((episode_data["high"].max() - episode_data["low"].min()) / episode_data["low"].min()) * 100
+            # Calculate episode statistics
+            price_change = (episode_data["close"].iloc[-1] - episode_data["close"].iloc[0]) / episode_data["close"].iloc[0] * 100
+            max_price_change = ((episode_data["high"].max() - episode_data["low"].min()) / episode_data["low"].min()) * 100
 
-                # Key feature statistics during episode
-                feature_stats = {}
-                key_features = [
-                    "close", "volume_z", "rsi_smooth", "macd_smooth", "atr_smooth",
-                    "pos_in_band_rel", "ema_spread_rel", "local_vol_index"
-                ]
+            # Key feature statistics during episode
+            feature_stats = {}
+            key_features = [
+                "close", "volume_z", "rsi_smooth", "macd_smooth", "atr_smooth",
+                "pos_in_band_rel", "ema_spread_rel", "local_vol_index"
+            ]
 
-                for feature in key_features:
+            for feature in key_features:
                     if feature in episode_data.columns:
                         values = episode_data[feature].dropna()
                         if not values.empty:
@@ -1379,24 +1387,23 @@ def extract_episode_data(tickers: Sequence[str], buyer_df: pd.DataFrame, seller_
                                 "end": float(values.iloc[-1])
                             }
 
-                # Event signals during episode
-                event_signals = {}
-                event_columns = [col for col in df.columns if col.startswith('event_') or col.startswith('label_')]
-                for event_col in event_columns:
-                    if event_col in episode_data.columns:
-                        signal_values = episode_data[event_col].dropna()
-                        if not signal_values.empty:
-                            event_signals[event_col] = {
-                                "active_periods": int(signal_values.sum()),
-                                "max_intensity": float(signal_values.max()),
-                                "avg_intensity": float(signal_values.mean())
-                            }
+            # Event signals during episode
+            event_signals = {}
+            event_columns = [col for col in ticker_data.columns if col.startswith('event_') or col.startswith('label_')]
+            for event_col in event_columns:
+                if event_col in episode_data.columns:
+                    signal_values = episode_data[event_col].dropna()
+                    if not signal_values.empty:
+                        event_signals[event_col] = {
+                            "active_periods": int(signal_values.sum()),
+                            "max_intensity": float(signal_values.max()),
+                            "avg_intensity": float(signal_values.mean())
+                        }
 
                 # Create episode record
                 episode_record = {
                     "episode_id": int(episode_id),
                     "ticker": ticker,
-                    "mode": mode_name,
                     "event_type": event_type,
                     "episode_label": episode_label,
                     "start_date": start_date.isoformat(),
@@ -1413,21 +1420,19 @@ def extract_episode_data(tickers: Sequence[str], buyer_df: pd.DataFrame, seller_
 
                 # Update summary statistics
                 summary_stats["total_episodes"] += 1
-                summary_stats["by_mode"][mode_name] += 1
-                summary_stats["by_ticker"][ticker][mode_name] += 1
+                summary_stats["by_ticker"][ticker] += 1
 
                 if event_type not in summary_stats["by_event_type"]:
-                    summary_stats["by_event_type"][event_type] = {"buyer": 0, "seller": 0}
-                summary_stats["by_event_type"][event_type][mode_name] += 1
+                    summary_stats["by_event_type"][event_type] = 0
+                summary_stats["by_event_type"][event_type] += 1
 
-                summary_stats["episode_lengths"][mode_name].append(duration)
+                summary_stats["episode_lengths"].append(duration)
 
-    # Calculate averages
-    for mode in ["buyer", "seller"]:
-        if summary_stats["episode_lengths"][mode]:
-            summary_stats["avg_episode_length"][mode] = sum(summary_stats["episode_lengths"][mode]) / len(summary_stats["episode_lengths"][mode])
-        else:
-            summary_stats["avg_episode_length"][mode] = 0
+    # Calculate average episode length
+    if summary_stats["episode_lengths"]:
+        summary_stats["avg_episode_length"] = sum(summary_stats["episode_lengths"]) / len(summary_stats["episode_lengths"])
+    else:
+        summary_stats["avg_episode_length"] = 0
 
     # Sort episodes by date
     episodes.sort(key=lambda x: (x["ticker"], x["start_date"], x["episode_id"]))
@@ -1447,20 +1452,17 @@ def extract_episode_data(tickers: Sequence[str], buyer_df: pd.DataFrame, seller_
 
 def _create_combined_event_chart(
     ticker: str,
-    buyer_df: pd.DataFrame,
-    seller_df: pd.DataFrame,
-    buyer_explorer: M002FeatureExplorer,
-    seller_explorer: M002FeatureExplorer,
+    features_df: pd.DataFrame,
+    explorer: M002FeatureExplorer,
 ) -> go.Figure:
-    """Create a chart comparing buyer and seller events with colored regions."""
+    """Create a chart showing all events with colored regions and event markers."""
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
     # Filter data for ticker
-    buyer_subset = buyer_df[buyer_df["ticker"] == ticker].copy()
-    seller_subset = seller_df[seller_df["ticker"] == ticker].copy()
+    subset = features_df[features_df["ticker"] == ticker].copy()
 
-    if buyer_subset.empty or seller_subset.empty:
+    if subset.empty:
         raise ValueError(f"No data available for ticker {ticker}")
 
     # Create subplots
@@ -1470,55 +1472,101 @@ def _create_combined_event_chart(
         vertical_spacing=0.05,
         subplot_titles=[
             "Price Chart with Event Regions",
-            "Buyer Events (Green Regions)",
-            "Seller Events (Red Regions)"
+            "All Events Markers",
+            "Event Signals & Labels"
         ]
     )
 
     # Common date range
-    dates = buyer_subset["date"]
+    dates = subset["date"]
 
     # 1. Price chart with colored regions
-    price_scaled = buyer_explorer._minmax_scale(buyer_subset["close"])
+    price_scaled = explorer._minmax_scale(subset["close"])
 
-    # Add price line
+    # Create price line segments with different colors for event periods
+    event_line_colors = {
+        "event_local_vol_spike": "orange",
+        "event_rebound_candidate": "green",
+        "event_volume_regain": "lime",
+        "event_exhaustion_candidate": "red",
+        "event_breakdown_risk": "darkred"
+    }
+
+    event_names = {
+        "event_local_vol_spike": "Local Vol Spike",
+        "event_rebound_candidate": "Rebound Candidate",
+        "event_volume_regain": "Volume Regain",
+        "event_exhaustion_candidate": "Exhaustion Candidate",
+        "event_breakdown_risk": "Breakdown Risk"
+    }
+
+    # Add price line segments for each event type
+    for event_col, color in event_line_colors.items():
+        if event_col in subset.columns:
+            event_mask = subset[event_col] > 0
+            if event_mask.any():
+                event_dates = dates[event_mask]
+                event_prices = price_scaled[event_mask]
+                fig.add_trace(
+                    go.Scatter(
+                        x=event_dates,
+                        y=event_prices,
+                        mode="lines",
+                        line=dict(color=color, width=3),
+                        name=f"Price during {event_names[event_col]}",
+                        showlegend=True
+                    ),
+                    row=1, col=1
+                )
+
+    # Add default price line (non-event periods)
+    non_event_mask = ~subset[[col for col in event_line_colors.keys() if col in subset.columns]].any(axis=1)
+    if non_event_mask.any():
+        fig.add_trace(
+            go.Scatter(
+                x=dates[non_event_mask],
+                y=price_scaled[non_event_mask],
+                mode="lines",
+                line=dict(color="black", width=2),
+                name="Price (normal periods)",
+                showlegend=True
+            ),
+            row=1, col=1
+        )
+
+    # 2. All Events Markers - Show event points on price chart
+    # Add price line to the markers subplot as well
     fig.add_trace(
         go.Scatter(
-            x=dates, y=price_scaled,
-            mode="lines", name="Price (normalized)",
-            line=dict(color="black", width=2)
+            x=dates,
+            y=price_scaled,
+            mode="lines",
+            line=dict(color="gray", width=2, dash="dot"),
+            name="Price (reference)",
+            showlegend=True
         ),
-        row=1, col=1
+        row=2, col=1
     )
 
-    # Color regions based on active events
-    buyer_events = buyer_explorer._mode_event_columns()
-    seller_events = seller_explorer._mode_event_columns()
+    event_marker_colors = {
+        "event_local_vol_spike": "orange",
+        "event_rebound_candidate": "green",
+        "event_volume_regain": "lime",
+        "event_exhaustion_candidate": "red",
+        "event_breakdown_risk": "darkred"
+    }
 
-    # Create colored background regions
-    for event_col in buyer_events:
-        if event_col in buyer_subset.columns:
-            event_mask = buyer_subset[event_col] > 0
-            if event_mask.any():
-                event_dates = dates[event_mask]
-                event_prices = price_scaled[event_mask]
-                # Add filled area for event regions
-                fig.add_trace(
-                    go.Scatter(
-                        x=event_dates,
-                        y=event_prices,
-                        fill='tozeroy',
-                        mode='none',
-                        fillcolor='rgba(0, 255, 0, 0.1)',
-                        name=f'Buyer: {event_col}',
-                        showlegend=True
-                    ),
-                    row=1, col=1
-                )
+    event_symbols = {
+        "event_local_vol_spike": "star",
+        "event_rebound_candidate": "triangle-up",
+        "event_volume_regain": "circle",
+        "event_exhaustion_candidate": "triangle-down",
+        "event_breakdown_risk": "x"
+    }
 
-    for event_col in seller_events:
-        if event_col in seller_subset.columns:
-            event_mask = seller_subset[event_col] > 0
+    for event_col in event_marker_colors.keys():
+        if event_col in subset.columns:
+            event_mask = subset[event_col] > 0
             if event_mask.any():
                 event_dates = dates[event_mask]
                 event_prices = price_scaled[event_mask]
@@ -1526,53 +1574,107 @@ def _create_combined_event_chart(
                     go.Scatter(
                         x=event_dates,
                         y=event_prices,
-                        fill='tozeroy',
-                        mode='none',
-                        fillcolor='rgba(255, 0, 0, 0.1)',
-                        name=f'Seller: {event_col}',
+                        mode="markers",
+                        marker=dict(
+                            color=event_marker_colors[event_col],
+                            symbol=event_symbols[event_col],
+                            size=8,
+                            line=dict(width=1, color='black')
+                        ),
+                        name=f'{event_names[event_col]} Points',
                         showlegend=True
                     ),
-                    row=1, col=1
+                    row=2, col=1
                 )
 
-    # 2. Buyer events panel
-    buyer_colors = ['limegreen', 'green', 'darkgreen', 'lightgreen', 'springgreen']
-    for i, event_col in enumerate(buyer_events):
-        if event_col in buyer_subset.columns:
-            fig.add_trace(
-                go.Scatter(
-                    x=dates,
-                    y=buyer_subset[event_col],
-                    mode="lines",
-                    line=dict(color=buyer_colors[i % len(buyer_colors)], width=2, shape='hv'),
-                    fill='tozeroy',
-                    fillcolor=buyer_colors[i % len(buyer_colors)].replace('1.0', '0.3'),
-                    name=f'Buyer: {event_col}'
-                ),
-                row=2, col=1
-            )
+    # 3. Event Signals & Labels - Show soft labels and signals
+    # Add price reference line to the signals subplot
+    fig.add_trace(
+        go.Scatter(
+            x=dates,
+            y=price_scaled,
+            mode="lines",
+            line=dict(color="gray", width=2, dash="dot"),
+            name="Price (reference)",
+            showlegend=True
+        ),
+        row=3, col=1
+    )
 
-    # 3. Seller events panel
-    seller_colors = ['red', 'darkred', 'tomato', 'crimson', 'firebrick']
-    for i, event_col in enumerate(seller_events):
-        if event_col in seller_subset.columns:
-            fig.add_trace(
-                go.Scatter(
-                    x=dates,
-                    y=seller_subset[event_col],
-                    mode="lines",
-                    line=dict(color=seller_colors[i % len(seller_colors)], width=2, shape='hv'),
-                    fill='tozeroy',
-                    fillcolor=seller_colors[i % len(seller_colors)].replace('1.0', '0.3'),
-                    name=f'Seller: {event_col}'
+    # Add soft labels (smoothed signals)
+    if "label_buy_soft" in subset.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=dates,
+                y=subset["label_buy_soft"],
+                mode="lines",
+                line=dict(color="green", width=2, dash="dot"),
+                name="Buy Soft Label",
+                fill='tozeroy',
+                fillcolor='rgba(0, 255, 0, 0.1)'
+            ),
+            row=3, col=1
+        )
+
+    if "label_sell_soft" in subset.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=dates,
+                y=subset["label_sell_soft"],
+                mode="lines",
+                line=dict(color="red", width=2, dash="dot"),
+                name="Sell Soft Label",
+                fill='tozeroy',
+                fillcolor='rgba(255, 0, 0, 0.1)'
+            ),
+            row=3, col=1
+        )
+
+    # Add buy/sell signals from inflection points
+    if "buy_signal" in subset.columns and subset["buy_signal"].any():
+        buy_dates = dates[subset["buy_signal"] == 1]
+        buy_prices = price_scaled[subset["buy_signal"] == 1]
+        fig.add_trace(
+            go.Scatter(
+                x=buy_dates,
+                y=buy_prices,
+                mode="markers",
+                marker=dict(
+                    color="green",
+                    symbol="triangle-up",
+                    size=12,
+                    line=dict(width=2, color='darkgreen')
                 ),
-                row=3, col=1
-            )
+                name="Buy Signals (Inflection)",
+                showlegend=True
+            ),
+            row=3, col=1
+        )
+
+    if "sell_signal" in subset.columns and subset["sell_signal"].any():
+        sell_dates = dates[subset["sell_signal"] == -1]
+        sell_prices = price_scaled[subset["sell_signal"] == -1]
+        fig.add_trace(
+            go.Scatter(
+                x=sell_dates,
+                y=sell_prices,
+                mode="markers",
+                marker=dict(
+                    color="red",
+                    symbol="triangle-down",
+                    size=12,
+                    line=dict(width=2, color='darkred')
+                ),
+                name="Sell Signals (Inflection)",
+                showlegend=True
+            ),
+            row=3, col=1
+        )
 
     # Update layout
     fig.update_layout(
         height=900,
-        title=f"{ticker} — Combined Buyer/Seller Event Analysis",
+        title=f"{ticker} — All Events Analysis with Signals",
         hovermode="x unified",
         legend=dict(
             orientation="h",
@@ -1592,18 +1694,16 @@ def _create_combined_event_chart(
 
 def _create_episode_visualization(
     ticker: str,
-    buyer_df: pd.DataFrame,
-    seller_df: pd.DataFrame,
+    features_df: pd.DataFrame,
 ) -> go.Figure:
-    """Create visualization showing local episodes for both modes."""
+    """Create visualization showing local episodes for all events."""
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
     # Filter data for ticker
-    buyer_subset = buyer_df[buyer_df["ticker"] == ticker].copy()
-    seller_subset = seller_df[seller_df["ticker"] == ticker].copy()
+    subset = features_df[features_df["ticker"] == ticker].copy()
 
-    if buyer_subset.empty or seller_subset.empty:
+    if subset.empty:
         raise ValueError(f"No data available for ticker {ticker}")
 
     # Create subplot
@@ -1612,111 +1712,117 @@ def _create_episode_visualization(
         shared_xaxes=True,
         vertical_spacing=0.05,
         subplot_titles=[
-            "Buyer Mode - Local Episodes",
-            "Seller Mode - Local Episodes"
+            "Price Chart with Episode Regions",
+            "All Events - Episode Analysis"
         ]
     )
 
-    dates = buyer_subset["date"]
+    dates = subset["date"]
 
-    # Color mapping for episodes
-    colors = [
-        'rgba(0, 255, 0, 0.3)',   # Green for buyer
-        'rgba(255, 0, 0, 0.3)',   # Red for seller
-        'rgba(0, 0, 255, 0.3)',   # Blue
-        'rgba(255, 255, 0, 0.3)', # Yellow
-        'rgba(255, 0, 255, 0.3)', # Magenta
-        'rgba(0, 255, 255, 0.3)', # Cyan
-    ]
+    # Color mapping for episodes by event type
+    event_colors = {
+        "event_local_vol_spike": 'rgba(255, 165, 0, 0.2)',  # Orange
+        "event_rebound_candidate": 'rgba(0, 255, 0, 0.2)',   # Green
+        "event_volume_regain": 'rgba(0, 255, 0, 0.25)',     # Darker Green
+        "event_exhaustion_candidate": 'rgba(255, 0, 0, 0.2)', # Red
+        "event_breakdown_risk": 'rgba(255, 0, 0, 0.25)'      # Darker Red
+    }
 
-    # Buyer episodes
-    buyer_episode_ids = buyer_subset["local_episode_id"].unique()
-    buyer_episode_ids = buyer_episode_ids[buyer_episode_ids >= 0]  # Exclude -1
+    event_names = {
+        "event_local_vol_spike": "Local Vol Spike",
+        "event_rebound_candidate": "Rebound Candidate",
+        "event_volume_regain": "Volume Regain",
+        "event_exhaustion_candidate": "Exhaustion Candidate",
+        "event_breakdown_risk": "Breakdown Risk"
+    }
 
-    price_scaled = buyer_subset["close"] / buyer_subset["close"].max()  # Simple scaling
+    price_scaled = subset["close"] / subset["close"].max()  # Simple scaling
 
-    for episode_id in buyer_episode_ids[:6]:  # Limit to 6 episodes for readability
-        mask = buyer_subset["local_episode_id"] == episode_id
+    # Add base price line
+    fig.add_trace(
+        go.Scatter(
+            x=dates,
+            y=price_scaled,
+            mode="lines",
+            line=dict(color="black", width=1),
+            name="Price (normalized)",
+            showlegend=True
+        ),
+        row=1, col=1
+    )
+
+    # Get all unique episode IDs
+    all_episode_ids = subset["local_episode_id"].unique()
+    all_episode_ids = all_episode_ids[all_episode_ids >= 0]  # Exclude -1
+
+    # Group episodes by event type and show top episodes for each
+    episodes_by_event = {}
+    for episode_id in all_episode_ids:
+        mask = subset["local_episode_id"] == episode_id
         if mask.any():
-            episode_dates = dates[mask]
-            episode_prices = price_scaled[mask]
-            episode_label = buyer_subset.loc[mask, "local_episode_label"].iloc[0]
+            episode_label = subset.loc[mask, "local_episode_label"].iloc[0]
+            event_type = episode_label.split(':')[0]  # Extract event type from label
+            if event_type not in episodes_by_event:
+                episodes_by_event[event_type] = []
+            episodes_by_event[event_type].append(episode_id)
 
+    # Show top 2-3 episodes for each event type
+    for event_type, episode_ids in episodes_by_event.items():
+        color = event_colors.get(event_type, 'rgba(128, 128, 128, 0.2)')  # Default gray
+        for episode_id in episode_ids[:2]:  # Limit to 2 episodes per event type
+            mask = subset["local_episode_id"] == episode_id
+            if mask.any():
+                episode_dates = dates[mask]
+                episode_prices = price_scaled[mask]
+                episode_label = subset.loc[mask, "local_episode_label"].iloc[0]
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=episode_dates,
+                        y=episode_prices,
+                        fill='tozeroy',
+                        mode='lines',
+                        line=dict(width=2),
+                        fillcolor=color,
+                        name=f'{event_type} Episode {episode_id}',
+                        showlegend=True
+                    ),
+                    row=1, col=1
+                )
+
+    # Second subplot: Show event signals over time
+    for event_col, color in event_colors.items():
+        if event_col in subset.columns:
             fig.add_trace(
                 go.Scatter(
-                    x=episode_dates,
-                    y=episode_prices,
+                    x=dates,
+                    y=subset[event_col],
+                    mode="lines",
+                    line=dict(color=color.replace('0.2', '1.0'), width=2, shape='hv'),
                     fill='tozeroy',
-                    mode='lines',
-                    line=dict(width=2),
-                    fillcolor=colors[episode_id % len(colors)],
-                    name=f'Buyer Episode {episode_id}: {episode_label}',
-                    showlegend=True
-                ),
-                row=1, col=1
-            )
-
-    # Seller episodes
-    seller_episode_ids = seller_subset["local_episode_id"].unique()
-    seller_episode_ids = seller_episode_ids[seller_episode_ids >= 0]  # Exclude -1
-
-    for episode_id in seller_episode_ids[:6]:  # Limit to 6 episodes for readability
-        mask = seller_subset["local_episode_id"] == episode_id
-        if mask.any():
-            episode_dates = dates[mask]
-            episode_prices = price_scaled[mask]  # Use same scaling
-            episode_label = seller_subset.loc[mask, "local_episode_label"].iloc[0]
-
-            fig.add_trace(
-                go.Scatter(
-                    x=episode_dates,
-                    y=episode_prices,
-                    fill='tozeroy',
-                    mode='lines',
-                    line=dict(width=2),
-                    fillcolor=colors[episode_id % len(colors)],
-                    name=f'Seller Episode {episode_id}: {episode_label}',
+                    fillcolor=color,
+                    name=f'{event_names.get(event_col, event_col)} Signal',
                     showlegend=True
                 ),
                 row=2, col=1
             )
 
-    # Add price line to both
-    fig.add_trace(
-        go.Scatter(
-            x=dates, y=price_scaled,
-            mode="lines", name="Price (normalized)",
-            line=dict(color="black", width=1, dash="dot")
-        ),
-        row=1, col=1
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=dates, y=price_scaled,
-            mode="lines", name="Price (normalized)",
-            line=dict(color="black", width=1, dash="dot"),
-            showlegend=False
-        ),
-        row=2, col=1
-    )
-
     # Update layout
     fig.update_layout(
         height=800,
-        title=f"{ticker} — Local Episode Analysis (Buyer vs Seller)",
+        title=f"{ticker} — Local Episodes Analysis",
         hovermode="x unified",
         legend=dict(
             orientation="h",
             yanchor="bottom",
             y=1.02,
-            x=0,
-            font=dict(size=8)
+            x=0
         )
     )
 
-    fig.update_yaxes(title_text="Price (0-1)", row=1, col=1)
-    fig.update_yaxes(title_text="Price (0-1)", row=2, col=1)
+    fig.update_xaxes(title_text="Date", row=2, col=1)
+    fig.update_yaxes(title_text="Price (normalized)", row=1, col=1)
+    fig.update_yaxes(title_text="Event Signals (0-1)", row=2, col=1)
 
     return fig
 

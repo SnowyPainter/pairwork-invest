@@ -1,4 +1,0 @@
-ticker,event_local_vol_spike,event_rebound_candidate,event_volume_regain,event_exhaustion_candidate,event_breakdown_risk
-AAPL,19.0,8.0,34.0,0.0,0.0
-GOOGL,34.0,9.0,48.0,0.0,0.0
-MSFT,29.0,2.0,32.0,0.0,0.0

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Generate M002 feature visualizations for buyer and seller modes.
+Generate M002 feature visualizations - Combined mode with all events.
 
 Usage:
     python features/generate_m002_visualizations.py --tickers AAPL MSFT GOOGL --start 2023-01-01
-    python features/generate_m002_visualizations.py --tickers AAPL MSFT --start 2023-01-01 --end 2023-12-31 --mode buyer
+    python features/generate_m002_visualizations.py --tickers AAPL MSFT --start 2023-01-01 --end 2023-12-31
 """
 
 import argparse
@@ -15,11 +15,11 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from features.M002_FeatureExplorer import generate_visualizations, generate_combined_visualizations
+from features.M002_FeatureExplorer import generate_combined_visualizations
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate M002 feature visualizations")
+    parser = argparse.ArgumentParser(description="Generate M002 combined feature visualizations")
     parser.add_argument(
         "--tickers", "-t",
         nargs="+",
@@ -34,12 +34,6 @@ def main():
     parser.add_argument(
         "--end", "-e",
         help="End date (YYYY-MM-DD), optional"
-    )
-    parser.add_argument(
-        "--mode", "-m",
-        choices=["buyer", "seller", "combined"],
-        default="buyer",
-        help="Analysis mode: buyer, seller, or combined (default: buyer)"
     )
     parser.add_argument(
         "--output-dir", "-o",
@@ -64,28 +58,16 @@ def main():
 
     args = parser.parse_args()
 
-    # Generate visualizations
-    if args.mode == "combined":
-        generate_combined_visualizations(
-            tickers=args.tickers,
-            start=args.start,
-            end=args.end,
-            output_dir=args.output_dir,
-            interval=args.interval,
-            progress=args.progress,
-            dropna=args.dropna,
-        )
-    else:
-        generate_visualizations(
-            tickers=args.tickers,
-            start=args.start,
-            end=args.end,
-            mode=args.mode,
-            output_dir=args.output_dir,
-            interval=args.interval,
-            progress=args.progress,
-            dropna=args.dropna,
-        )
+    # Generate combined visualizations (all events together)
+    generate_combined_visualizations(
+        tickers=args.tickers,
+        start=args.start,
+        end=args.end,
+        output_dir=args.output_dir,
+        interval=args.interval,
+        progress=args.progress,
+        dropna=args.dropna,
+    )
 
 
 if __name__ == "__main__":

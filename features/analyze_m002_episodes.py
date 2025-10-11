@@ -44,6 +44,10 @@ class M002EpisodeAnalyzer:
         df['start_date'] = pd.to_datetime(df['start_date'])
         df['end_date'] = pd.to_datetime(df['end_date'])
 
+        # mode 컬럼이 있다면 제거 (legacy 데이터 호환성)
+        if 'mode' in df.columns:
+            df = df.drop('mode', axis=1)
+
         return df
 
     def analyze_event_performance(self) -> pd.DataFrame:
@@ -80,33 +84,33 @@ class M002EpisodeAnalyzer:
 
         return perf_df
 
-    def analyze_mode_comparison(self) -> pd.DataFrame:
-        """Buyer vs Seller 모드 비교 분석"""
-        print("🔄 Buyer vs Seller 모드 비교")
-        print("=" * 40)
+    def analyze_event_distribution(self) -> pd.DataFrame:
+        """이벤트별 분포 및 성과 분석"""
+        print("📊 이벤트 분포 분석")
+        print("=" * 30)
 
-        mode_stats = []
+        event_stats = []
 
-        for mode in ['buyer', 'seller']:
-            mode_episodes = self.episodes_df[self.episodes_df['mode'] == mode]
+        for event_type in self.episodes_df['event_type'].unique():
+            event_episodes = self.episodes_df[self.episodes_df['event_type'] == event_type]
 
             stats = {
-                'mode': mode,
-                'total_episodes': len(mode_episodes),
-                'avg_price_change': mode_episodes['price_change_pct'].mean(),
-                'success_rate': (mode_episodes['price_change_pct'] > 0).mean() * 100,
-                'avg_duration': mode_episodes['duration_days'].mean(),
-                'total_return': mode_episodes['price_change_pct'].sum()
+                'event_type': event_type,
+                'total_episodes': len(event_episodes),
+                'avg_price_change': event_episodes['price_change_pct'].mean(),
+                'success_rate': (event_episodes['price_change_pct'] > 0).mean() * 100,
+                'avg_duration': event_episodes['duration_days'].mean(),
+                'total_return': event_episodes['price_change_pct'].sum()
             }
 
-            mode_stats.append(stats)
+            event_stats.append(stats)
 
-        mode_df = pd.DataFrame(mode_stats)
+        event_df = pd.DataFrame(event_stats).sort_values('total_episodes', ascending=False)
 
-        print(mode_df.to_string(index=False, float_format='%.2f'))
+        print(event_df.to_string(index=False, float_format='%.2f'))
         print()
 
-        return mode_df
+        return event_df
 
     def simulate_trading_strategy(self, capital: float = 10000) -> Dict[str, Any]:
         """간단한 매매 전략 시뮬레이션"""
@@ -299,7 +303,7 @@ class M002EpisodeAnalyzer:
 
         # 모든 분석 실행 (출력 없이)
         perf_df = self.analyze_event_performance()
-        mode_df = self.analyze_mode_comparison()
+        event_df = self.analyze_event_distribution()
         strategy_results = self.simulate_trading_strategy()
         risk_metrics = self.analyze_risk_metrics()
         recommendations = self.generate_strategy_recommendations()
@@ -308,35 +312,65 @@ class M002EpisodeAnalyzer:
         best_episode = self.episodes_df.loc[self.episodes_df['price_change_pct'].idxmax()].to_dict()
         worst_episode = self.episodes_df.loc[self.episodes_df['price_change_pct'].idxmin()].to_dict()
 
-        # Buyer/Seller 이벤트별 분석
-        buyer_episodes = self.episodes_df[self.episodes_df['mode'] == 'buyer']
-        seller_episodes = self.episodes_df[self.episodes_df['mode'] == 'seller']
+        # 모든 이벤트들을 통합하여 분석 후 재분배
+        all_event_performance = {}
 
+        # 모든 이벤트 타입에 대해 성과 분석
+        for event_type in self.episodes_df['event_type'].unique():
+            event_data = self.episodes_df[self.episodes_df['event_type'] == event_type]
+            all_event_performance[event_type] = {
+                'count': len(event_data),
+                'avg_return': float(event_data['price_change_pct'].mean()),
+                'win_rate': float((event_data['price_change_pct'] > 0).mean() * 100),
+                'best_episode': float(event_data['price_change_pct'].max()),
+                'worst_episode': float(event_data['price_change_pct'].min()),
+                'volatility': float(event_data['price_change_pct'].std()),
+                'total_return': float(event_data['price_change_pct'].sum())
+            }
+
+        # 성과 기반으로 Buyer/Seller 이벤트 재분배
+        # 규칙: 평균 수익률 > 0.5% → Buyer, < -0.5% → Seller, 그 외 → Neutral
         buyer_event_performance = {}
         seller_event_performance = {}
+        neutral_event_performance = {}
 
-        for event_type in buyer_episodes['event_type'].unique():
-            event_data = buyer_episodes[buyer_episodes['event_type'] == event_type]
-            buyer_event_performance[event_type] = {
-                'count': len(event_data),
-                'avg_return': float(event_data['price_change_pct'].mean()),
-                'win_rate': float((event_data['price_change_pct'] > 0).mean() * 100),
-                'best_episode': float(event_data['price_change_pct'].max()),
-                'worst_episode': float(event_data['price_change_pct'].min())
-            }
+        for event_type, stats in all_event_performance.items():
+            avg_return = stats['avg_return']
+            if avg_return > 0.5:  # 양수 수익률이 좋은 이벤트 → 매수 신호
+                buyer_event_performance[event_type] = stats
+            elif avg_return < -0.5:  # 음수 수익률이 나쁜 이벤트 → 매도 신호
+                seller_event_performance[event_type] = stats
+            else:  # 중립 이벤트
+                neutral_event_performance[event_type] = stats
 
-        for event_type in seller_episodes['event_type'].unique():
-            event_data = seller_episodes[seller_episodes['event_type'] == event_type]
-            seller_event_performance[event_type] = {
-                'count': len(event_data),
-                'avg_return': float(event_data['price_change_pct'].mean()),
-                'win_rate': float((event_data['price_change_pct'] > 0).mean() * 100),
-                'best_episode': float(event_data['price_change_pct'].max()),
-                'worst_episode': float(event_data['price_change_pct'].min())
-            }
+        # 재분배 결과 요약 출력
+        print("🎯 이벤트 재분배 결과:")
+        print(f"  총 이벤트 수: {len(all_event_performance)}")
+        print(f"  → Buyer 이벤트: {len(buyer_event_performance)}개")
+        print(f"  → Seller 이벤트: {len(seller_event_performance)}개")
+        print(f"  → Neutral 이벤트: {len(neutral_event_performance)}개")
+        print()
+
+        if buyer_event_performance:
+            print("🟢 재분배된 Buyer 이벤트들:")
+            for event, stats in buyer_event_performance.items():
+                print(f"  • {event}: +{stats['avg_return']:.2f}% (승률: {stats['win_rate']:.1f}%)")
+            print()
+
+        if seller_event_performance:
+            print("🔴 재분배된 Seller 이벤트들:")
+            for event, stats in seller_event_performance.items():
+                print(f"  • {event}: {stats['avg_return']:+.2f}% (승률: {stats['win_rate']:.1f}%)")
+            print()
+
+        if neutral_event_performance:
+            print("⚪ Neutral 이벤트들:")
+            for event, stats in neutral_event_performance.items():
+                print(f"  • {event}: {stats['avg_return']:+.2f}% (승률: {stats['win_rate']:.1f}%)")
+            print()
 
         # 에피소드별 피처 패턴 분석 (상위 5개 에피소드)
-        top_episodes = self.episodes_df.nlargest(5, 'price_change_pct')[['episode_id', 'event_type', 'mode', 'price_change_pct', 'feature_statistics']].to_dict('records')
+        top_episodes = self.episodes_df.nlargest(5, 'price_change_pct')[['episode_id', 'event_type', 'price_change_pct', 'feature_statistics']].to_dict('records')
 
         analysis_result = {
             "metadata": {
@@ -357,7 +391,6 @@ class M002EpisodeAnalyzer:
             "best_performing_episode": {
                 "episode_id": int(best_episode['episode_id']),
                 "ticker": best_episode['ticker'],
-                "mode": best_episode['mode'],
                 "event_type": best_episode['event_type'],
                 "price_change_pct": float(best_episode['price_change_pct']),
                 "duration_days": int(best_episode['duration_days']),
@@ -368,7 +401,6 @@ class M002EpisodeAnalyzer:
             "worst_performing_episode": {
                 "episode_id": int(worst_episode['episode_id']),
                 "ticker": worst_episode['ticker'],
-                "mode": worst_episode['mode'],
                 "event_type": worst_episode['event_type'],
                 "price_change_pct": float(worst_episode['price_change_pct']),
                 "duration_days": int(worst_episode['duration_days']),
@@ -379,14 +411,14 @@ class M002EpisodeAnalyzer:
             "event_performance": {
                 "buyer_events": buyer_event_performance,
                 "seller_events": seller_event_performance,
-                "overall_by_event_type": {
-                    event_type: {
-                        'count': len(group),
-                        'avg_return': float(group['price_change_pct'].mean()),
-                        'win_rate': float((group['price_change_pct'] > 0).mean() * 100),
-                        'volatility': float(group['price_change_pct'].std())
-                    }
-                    for event_type, group in self.episodes_df.groupby('event_type')
+                "neutral_events": neutral_event_performance,
+                "all_events_performance": all_event_performance,
+                "redistribution_summary": {
+                    "total_events": len(all_event_performance),
+                    "redistributed_to_buyer": len(buyer_event_performance),
+                    "redistributed_to_seller": len(seller_event_performance),
+                    "remained_neutral": len(neutral_event_performance),
+                    "redistribution_logic": "avg_return > 0.5% → Buyer, < -0.5% → Seller, else → Neutral"
                 }
             },
             "top_performing_episodes": top_episodes,
