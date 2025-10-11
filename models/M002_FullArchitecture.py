@@ -91,13 +91,16 @@ def _soft_policy_score(prob: np.ndarray, ret_pct: np.ndarray, dd_pct: np.ndarray
 @dataclass
 class PolicyConfig:
     theta_long: float = 0.05
-    theta_flat_low: float = 0.01
-    theta_short: float = -0.1
-    risk_aversion: float = 0.5
+    theta_flat_low: float = 0.0
+    theta_short: float = -0.05
+    risk_aversion: float = 0.45
     size_k: float = 1.0
     size_max: float = 1.0
     ex_ante_vol_window: int = 10
     restrict_short_on_peak_prob: float = 0.4
+    rescale_window: int = 60
+    score_scale: float = 2.5
+    use_rescaled_score: bool = True
 
 
 @dataclass
@@ -311,17 +314,39 @@ class M002FullArchitecture:
         out = df.copy()
 
         # ex-ante volatility (ATR-smooth rolling mean)
-        out["ex_ante_vol"] = out.groupby("ticker")["atr_smooth"].transform(
-            lambda s: s.rolling(cfg.ex_ante_vol_window, min_periods=1).mean()
+        out["ex_ante_vol"] = (
+            out.groupby("ticker")["atr_smooth"]
+            .transform(lambda s: s.rolling(cfg.ex_ante_vol_window, min_periods=1).mean())
+            .replace(0.0, np.nan)
         )
 
-        # base position
-        base = cfg.size_k * out["policy_score"] / out["ex_ante_vol"].replace(0, np.nan)
+        if cfg.use_rescaled_score:
+            window = max(cfg.rescale_window, 20)
+
+            def _rolling_z(series: pd.Series) -> pd.Series:
+                roll = series.rolling(window, min_periods=max(window // 3, 5))
+                mean = roll.mean()
+                std = roll.std(ddof=0).replace(0.0, np.nan)
+                return ((series - mean) / std).fillna(0.0)
+
+            out["policy_score_rescaled"] = (
+                out.groupby("ticker")["policy_score"].transform(_rolling_z) * cfg.score_scale
+            )
+            effective_score = out["policy_score_rescaled"]
+        else:
+            effective_score = out["policy_score"]
+
+        out["effective_score"] = effective_score
+
+        # base position sizing with effective score
+        base = cfg.size_k * effective_score / out["ex_ante_vol"]
         out["base_position_size"] = np.clip(base, -cfg.size_max, cfg.size_max).fillna(0.0)
 
         def decide(row: pd.Series) -> str:
-            score = float(row["policy_score"])
-            # mild heuristics
+            score = float(row["effective_score"])
+            if cfg.theta_flat_low is not None and abs(score) < cfg.theta_flat_low:
+                return "FLAT"
+
             if int(row.get("I_vr_and_vs", 0)) == 1:
                 score *= 0.8
             if int(row.get("I_bd_late", 0)) == 1:

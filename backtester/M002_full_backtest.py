@@ -245,7 +245,8 @@ class M002FullBacktester:
             cash=self.initial_cash,
             commission=self.commission,
             trade_on_close=False,
-            exclusive_orders=True
+            exclusive_orders=True,
+            finalize_trades=True
         )
         stats = bt.run()
 

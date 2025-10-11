@@ -1,30 +1,31 @@
 ,mean,median
-Duration,3 days 00:00:00,3 days 00:00:00
-Exposure Time [%],0.0,0.0
-Equity Final [$],10000.0,10000.0
-Equity Peak [$],10000.0,10000.0
-Return [%],0.0,0.0
-Buy & Hold Return [%],-16.5625,-16.5625
-Return (Ann.) [%],0.0,0.0
-Volatility (Ann.) [%],0.0,0.0
-CAGR [%],0.0,0.0
-Sharpe Ratio,,
-Sortino Ratio,,
-Calmar Ratio,,
-Alpha [%],0.0,0.0
-Beta,0.0,0.0
-Max. Drawdown [%],0.0,0.0
-Avg. Drawdown [%],,
-Max. Drawdown Duration,,
-Avg. Drawdown Duration,,
-# Trades,0.0,0.0
-Win Rate [%],,
-Best Trade [%],,
-Worst Trade [%],,
-Avg. Trade [%],,
-Max. Trade Duration,,
-Avg. Trade Duration,,
-Profit Factor,,
-Expectancy [%],,
-SQN,,
-Kelly Criterion,,
+Duration,1706 days 23:15:27.835051552,1831 days 00:00:00
+Exposure Time [%],71.80064510899989,78.35051546391753
+Equity Final [$],10497.004715864536,9683.060448122027
+Equity Peak [$],14598.630022298708,12677.763842624427
+Commissions [$],125.09350739017287,116.50195039212704
+Return [%],4.9700471586453565,-3.1693955187797296
+Buy & Hold Return [%],19.089092930671644,-7.6508658636528
+Return (Ann.) [%],68.10440849569903,-10.767084016594087
+Volatility (Ann.) [%],192446836.25217035,64.62888392989693
+CAGR [%],-1.1711862608331967,-0.48816774686921693
+Sharpe Ratio,-2.724925995376614,-0.16393284630015315
+Sortino Ratio,4.004990033212276,-0.3346388164642812
+Calmar Ratio,6.617107040997836,-0.47847397857316
+Alpha [%],-3.3831114841400223,-3.3620920396661624
+Beta,0.6242616890350813,0.7148139738701481
+Max. Drawdown [%],-32.87402661011518,-27.72611247034027
+Avg. Drawdown [%],-13.03018098298766,-9.156739108493328
+Max. Drawdown Duration,816 days 10:36:37.894736840,721 days 00:00:00
+Avg. Drawdown Duration,316 days 01:30:56.842105264,186 days 00:00:00
+# Trades,2.6597938144329896,3.0
+Win Rate [%],49.875939849624054,40.0
+Best Trade [%],26.25657381007245,12.048961132777652
+Worst Trade [%],-3.772214183181304,-11.97917235906775
+Avg. Trade [%],8.32006714798646,-1.4800055144930435
+Max. Trade Duration,1040 days 10:51:47.368421056,1098 days 00:00:00
+Avg. Trade Duration,639 days 22:59:22.105263160,491 days 00:00:00
+Profit Factor,6.178040483861544,0.16728632977103752
+Expectancy [%],10.20998501222583,-0.3192950633207492
+SQN,-0.6085854252410009,-0.617249732990488
+Kelly Criterion,-11.99736365152421,-0.2682396044706438

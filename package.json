@@ -20,6 +20,7 @@
     "features:m002:seller": "node scripts/run-python.mjs features/generate_m002_visualizations.py --mode seller",
     "features:m002:combined": "node scripts/run-python.mjs features/generate_m002_visualizations.py",
     "features:m002:visualize": "node scripts/run-python.mjs features/generate_m002_visualizations.py",
-    "features:m002:analyze": "node scripts/run-python.mjs features/analyze_m002_episodes.py"
+    "features:m002:analyze": "node scripts/run-python.mjs features/analyze_m002_episodes.py",
+    "features:m002:test": "node scripts/run-python.mjs features/test_m002_mark.py"
   }
 }
