@@ -12,6 +12,11 @@
     "train:direction": "node scripts/run-python.mjs models/M001_DirectionClassifier.py",
     "backtest:m001": "node scripts/run-python.mjs backtester/backtest_m001.py",
     "backtest:direction": "node scripts/run-python.mjs backtester/backtest_direction_classifier.py",
-    "analytics:direction": "node scripts/run-python.mjs analytics/M001_DirectionClassifier.py"
+    "analytics:direction": "node scripts/run-python.mjs analytics/M001_DirectionClassifier.py",
+    "features:m002:buyer": "node scripts/run-python.mjs features/generate_m002_visualizations.py --mode buyer",
+    "features:m002:seller": "node scripts/run-python.mjs features/generate_m002_visualizations.py --mode seller",
+    "features:m002:combined": "node scripts/run-python.mjs features/generate_m002_visualizations.py --mode combined",
+    "features:m002:visualize": "node scripts/run-python.mjs features/generate_m002_visualizations.py",
+    "features:m002:analyze": "node scripts/run-python.mjs features/analyze_m002_episodes.py"
   }
 }

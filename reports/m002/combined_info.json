@@ -1,0 +1,141 @@
+{
+  "tickers": [
+    "AAPL"
+  ],
+  "date_range": "2024-01-01 to latest",
+  "modes": [
+    "buyer",
+    "seller"
+  ],
+  "buyer_events": [
+    "event_local_vol_spike",
+    "event_rebound_candidate",
+    "event_volume_regain"
+  ],
+  "seller_events": [
+    "event_local_vol_spike",
+    "event_exhaustion_candidate",
+    "event_breakdown_risk"
+  ],
+  "total_rows": {
+    "buyer": 446,
+    "seller": 446
+  },
+  "episode_summary": {
+    "total_episodes": 72,
+    "by_mode": {
+      "buyer": 34,
+      "seller": 38
+    },
+    "by_event_type": {
+      "event_local_vol_spike": {
+        "buyer": 17,
+        "seller": 17
+      },
+      "event_rebound_candidate": {
+        "buyer": 5,
+        "seller": 0
+      },
+      "event_volume_regain": {
+        "buyer": 12,
+        "seller": 0
+      },
+      "event_breakdown_risk": {
+        "buyer": 0,
+        "seller": 13
+      },
+      "event_exhaustion_candidate": {
+        "buyer": 0,
+        "seller": 8
+      }
+    },
+    "by_ticker": {
+      "AAPL": {
+        "buyer": 34,
+        "seller": 38
+      }
+    },
+    "avg_episode_length": {
+      "buyer": 5.4411764705882355,
+      "seller": 5.078947368421052
+    },
+    "episode_lengths": {
+      "buyer": [
+        11,
+        1,
+        3,
+        1,
+        11,
+        1,
+        11,
+        1,
+        11,
+        1,
+        1,
+        1,
+        1,
+        11,
+        11,
+        1,
+        11,
+        4,
+        11,
+        1,
+        1,
+        11,
+        10,
+        11,
+        3,
+        1,
+        1,
+        1,
+        11,
+        6,
+        11,
+        1,
+        1,
+        11
+      ],
+      "seller": [
+        4,
+        11,
+        11,
+        1,
+        1,
+        1,
+        2,
+        11,
+        11,
+        1,
+        11,
+        11,
+        1,
+        6,
+        11,
+        1,
+        1,
+        11,
+        2,
+        2,
+        11,
+        1,
+        1,
+        1,
+        1,
+        11,
+        3,
+        1,
+        1,
+        1,
+        11,
+        2,
+        1,
+        11,
+        1,
+        11,
+        11,
+        2
+      ]
+    }
+  }
+}
