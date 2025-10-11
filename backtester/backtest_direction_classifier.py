@@ -20,8 +20,7 @@ import polars as pl
 import pandas as pd
 import numpy as np
 
-# 프로젝트 모듈 임포트
-sys.path.append(str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from models.M001_DirectionClassifier import (
     DirectionClassifierLGBM,

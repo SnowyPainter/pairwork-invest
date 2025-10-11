@@ -33,6 +33,8 @@ import seaborn as sns
 
 from data.dataset_builder import build_dataset
 
+NormalizationStats = Dict[str, Dict[str, float]]
+
 # === Feature Selection (다중공선성 고려) ===
 SELECTED_FEATURES = [
     # 수익률 그룹 (roc10 선택 - 가장 높은 중요도)
@@ -97,6 +99,7 @@ class DirectionClassifierLGBM:
         self.model = None
         self.feature_importance = None
         self.training_metrics = {}
+        self.normalization_stats: Optional[NormalizationStats] = None
 
     def add_prevday_turnover_feats(self, df: pl.DataFrame) -> pl.DataFrame:
         return (
@@ -150,7 +153,9 @@ class DirectionClassifierLGBM:
                   feature_set: str = "v2",
                   label_horizon: int = 1,
                   label_thresh: float = 0.05,
-                  train_mode: str = "conditional") -> Tuple[pd.DataFrame, pd.Series]:
+                  train_mode: str = "conditional",
+                  normalization_override: Optional[NormalizationStats] = None,
+                  store_stats: bool = True) -> Tuple[pd.DataFrame, pd.Series]:
         """
         학습 데이터를 로드하고 전처리
 
@@ -169,7 +174,10 @@ class DirectionClassifierLGBM:
         print(f"📊 Loading data for {market} market, years {years}...")
 
         # 데이터 로드
-        df = build_dataset(
+        stats_to_use = normalization_override or self.normalization_stats
+        request_stats = store_stats and stats_to_use is None
+
+        dataset_result = build_dataset(
             years=years,
             market=market,
             exchanges=None,
@@ -184,7 +192,16 @@ class DirectionClassifierLGBM:
             select_cols=None,
             drop_na_rows=True,
             verbose=False,
+            normalization_stats=stats_to_use,
+            return_normalization_stats=request_stats,
         )
+
+        if request_stats:
+            df, computed_stats = dataset_result
+            if store_stats:
+                self.normalization_stats = computed_stats
+        else:
+            df = dataset_result
 
         df = self.add_prevday_turnover_feats(df)
         if train_mode == "conditional":
@@ -240,7 +257,9 @@ class DirectionClassifierLGBM:
                     max_tickers=100,
                     feature_set="v2",
                     label_horizon=1,
-                    label_thresh=0.05
+                    label_thresh=0.05,
+                    normalization_override=self.normalization_stats,
+                    store_stats=False,
                 )
                 print(f"📊 Validation set: {X_val.shape}")
 
@@ -459,7 +478,8 @@ class DirectionClassifierLGBM:
             'feature_list': self.feature_list,
             'model_params': self.model_params,
             'feature_importance': self.feature_importance.to_dict() if self.feature_importance is not None else None,
-            'training_metrics': self.training_metrics
+            'training_metrics': self.training_metrics,
+            'normalization_stats': self.normalization_stats,
         }
 
         # JSON으로 메타데이터 저장 (pickle 문제 회피)
@@ -517,6 +537,7 @@ class DirectionClassifierLGBM:
             self.model_params = metadata.get('model_params', {})
             self.feature_importance = pd.DataFrame(metadata.get('feature_importance', {}))
             self.training_metrics = metadata.get('training_metrics', {})
+            self.normalization_stats = metadata.get('normalization_stats')
         else:
             print(f"  [경고] 메타데이터 파일이 없어 기본값 사용")
 
@@ -610,4 +631,3 @@ if __name__ == "__main__":
 
     if 'cv_accuracy_mean' in model.training_metrics:
         print(f"🏆 CV Accuracy: {model.training_metrics.get('cv_accuracy_mean', 'N/A'):.4f} ± {model.training_metrics.get('cv_accuracy_std', 'N/A'):.4f}")
-

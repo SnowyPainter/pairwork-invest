@@ -3,3 +3,4 @@ data/silver/
 __pycache__/
 data/cache/
 data/silver_test/
+node_modules/

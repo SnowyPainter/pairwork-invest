@@ -25,8 +25,8 @@ import polars as pl
 import pandas as pd
 import numpy as np
 
-# 프로젝트 모듈 경로
-sys.path.append(str(Path(__file__).parent.parent))
+# 프로젝트 모듈 경로 - 맨 앞에 추가해서 우선순위 높임
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from models.M001_DirectionClassifier import (
     DirectionClassifierLGBM,

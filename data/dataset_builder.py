@@ -14,7 +14,7 @@ import os
 import hashlib
 import json
 from pathlib import Path
-from typing import Iterable, Optional, Literal
+from typing import Dict, Iterable, Optional, Literal
 from datetime import date
 
 import polars as pl
@@ -26,6 +26,7 @@ from labelers.basic import future_return_labels
 
 
 Market = Literal["KR", "US"]
+NormalizationStats = Dict[str, Dict[str, float]]
 
 
 def _quick_counts(lf: pl.LazyFrame, tag: str, verbose: bool = False):
@@ -146,7 +147,9 @@ def build_dataset(
     force_recompute: bool = False,
     cache_invalidate_on: Literal["never", "silver_mtime"] = "silver_mtime",
     normalize_features: bool = True,  # Z-score 정규화 적용 여부
-) -> pl.DataFrame:
+    normalization_stats: Optional[NormalizationStats] = None,
+    return_normalization_stats: bool = False,
+) -> pl.DataFrame | tuple[pl.DataFrame, NormalizationStats]:
     """
     데이터셋 빌드 함수
     
@@ -170,6 +173,8 @@ def build_dataset(
         force_recompute: 강제 재계산 여부
         cache_invalidate_on: 캐시 무효화 조건
         normalize_features: Z-score 정규화 적용 여부
+        normalization_stats: 외부에서 주입된 정규화 통계 (mean/std). 제공 시 해당 값을 사용
+        return_normalization_stats: True일 때 (DataFrame, stats) 튜플 반환
     
     Returns:
         빌드된 데이터프레임
@@ -177,6 +182,8 @@ def build_dataset(
     if verbose:
         print(f"Building dataset: {market}, years={years}, normalize={normalize_features}")
     
+    normalization_stats_used: NormalizationStats | None = None
+
     # 1. 캐시 확인
     cache_path: Path | None = None
     if use_cache and not force_recompute:
@@ -274,19 +281,64 @@ def build_dataset(
         ]
         
         if feature_cols:
-            # Z-score 정규화 적용
-            normalize_exprs = []
+            provided_stats = normalization_stats or {}
+            stats_for_use: NormalizationStats = {}
+            newly_computed: NormalizationStats = {}
+
+            def _sanitize_stats(mean_val: float, std_val: float) -> Dict[str, float]:
+                std_val = float(std_val)
+                if abs(std_val) < 1e-12:
+                    std_val = 1.0
+                return {"mean": float(mean_val), "std": std_val}
+
+            missing_cols = [
+                col for col in feature_cols
+                if col not in provided_stats or abs(float(provided_stats[col].get("std", 0.0))) < 1e-12
+            ]
+
+            if missing_cols:
+                stats_exprs = []
+                for col in missing_cols:
+                    stats_exprs.append(pl.col(col).mean().alias(f"{col}__mean"))
+                    stats_exprs.append(pl.col(col).std().alias(f"{col}__std"))
+                stats_frame = lf.select(stats_exprs).collect(streaming=False)
+
+                for col in missing_cols:
+                    mean_val = stats_frame[f"{col}__mean"][0]
+                    std_val = stats_frame[f"{col}__std"][0]
+                    stats_for_use[col] = _sanitize_stats(mean_val, std_val)
+                newly_computed = {col: stats_for_use[col] for col in missing_cols}
+
+            # 주입된 통계 포함 (sanitize)
             for col in feature_cols:
-                x = pl.col(col)
-                z_score = (x - x.mean()) / (x.std() + 1e-9)  # 0으로 나누기 방지
-                normalize_exprs.append(z_score.alias(col))
-            
-            # 정규화된 피처로 교체
+                if col in stats_for_use:
+                    continue
+                if col in provided_stats:
+                    stats_for_use[col] = _sanitize_stats(
+                        provided_stats[col].get("mean", 0.0),
+                        provided_stats[col].get("std", 1.0),
+                    )
+
+            # 누락된 컬럼은 평균 0, 표준편차 1로 fallback
+            for col in feature_cols:
+                if col not in stats_for_use:
+                    stats_for_use[col] = {"mean": 0.0, "std": 1.0}
+
+            normalization_stats_used = {col: dict(stats_for_use[col]) for col in feature_cols}
+
+            normalize_exprs = [
+                ((pl.col(col) - stats_for_use[col]["mean"]) / stats_for_use[col]["std"]).alias(col)
+                for col in feature_cols
+            ]
+
             keep_cols = [c for c in schema_names if c not in feature_cols]
             lf = lf.with_columns(normalize_exprs).select(keep_cols + feature_cols)
-            
+
             if verbose:
-                print(f"[normalize] Applied Z-score to {len(feature_cols)} features")
+                computed_cnt = len(newly_computed)
+                reused_cnt = len(feature_cols) - computed_cnt
+                print(f"[normalize] Applied Z-score to {len(feature_cols)} features "
+                      f"(computed={computed_cnt}, reused={reused_cnt})")
         else:
             if verbose:
                 print("[normalize] No features to normalize")
@@ -335,5 +387,8 @@ def build_dataset(
     
     if verbose:
         print(f"✅ Dataset built: {len(df):,} rows × {len(df.columns)} columns")
+
+    if return_normalization_stats:
+        return df, (normalization_stats_used or {})
     
     return df

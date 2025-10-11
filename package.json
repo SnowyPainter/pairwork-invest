@@ -1,0 +1,17 @@
+{
+  "name": "pairwork-invest",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Workflow scripts for backtesting, training, and analytics in the Pairwork Invest project.",
+  "engines": {
+    "pnpm": ">=8"
+  },
+  "scripts": {
+    "py": "node scripts/run-python.mjs",
+    "py:deps": "node scripts/run-python.mjs -m pip install -r requirements.txt",
+    "train:direction": "node scripts/run-python.mjs models/M001_DirectionClassifier.py",
+    "backtest:m001": "node scripts/run-python.mjs backtester/backtest_m001.py",
+    "backtest:direction": "node scripts/run-python.mjs backtester/backtest_direction_classifier.py",
+    "analytics:direction": "node scripts/run-python.mjs analytics/M001_DirectionClassifier.py"
+  }
+}
