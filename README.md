@@ -56,3 +56,20 @@ pnpm run py -m data.dataset_builder
 - Python 패키지 목록은 `requirements.txt`에서 관리합니다.
 - 빌드/백테스트 결과물은 기존과 동일하게 `reports/` 하위에 생성됩니다.
 - Node 의존성은 아직 없지만, 추후 필요한 도구(예: 문서/리포트 자동화)를 추가할 때 `pnpm add <pkg>`로 쉽게 확장 가능합니다.
+
+## 6. 야후 파이낸스 데이터로 M002 예측 실행
+
+- `apps/m002_yfinance_predict.py` 스크립트는 yfinance에서 받은 OHLCV를 프로젝트 파이프라인에 맞게 정규화하고, 저장된 M002 Full Architecture 모델로 정책 시그널을 생성한다.
+- 실행 예시는 다음과 같다.
+
+```bash
+pnpm run py -m apps.m002_yfinance_predict -- \
+  --tickers AAPL MSFT \
+  --start 2020-01-01 \
+  --end 2024-01-01 \
+  --model-path models/saved/m002_full_architecture_US_2010_2011_2012_2013_2014_2015_2016_2017_2018.pkl \
+  --save-csv reports/m002_yf_scores.csv
+```
+
+- `--normalization-stats` 인자를 사용하면 학습 시점에 사용한 Z-score 통계를 JSON으로 주입할 수 있으며, 제공되지 않은 경우에는 모델 내부에 저장된 통계나 원시 피처를 그대로 활용한다.
+- 기본적으로 `apply_normalization`은 베이스 컬럼을 제외한 피처만 표준화하며, 결과는 `reports/` 등 원하는 경로에 CSV 또는 Parquet으로 저장할 수 있다.
