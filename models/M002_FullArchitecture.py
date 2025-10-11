@@ -88,20 +88,18 @@ def _soft_policy_score(prob: np.ndarray, ret_pct: np.ndarray, dd_pct: np.ndarray
 # ---------------------------
 # Configs
 # ---------------------------
-
 @dataclass
 class PolicyConfig:
-    theta_long: float = 0.01
-    theta_flat_low: float = 0.0
-    theta_short: float = -0.01
-    risk_aversion: float = 0.45
-    size_k: float = 1.0
+    target_flat_ratio: float = 0.4
+    target_short_ratio: float = 0.15
+    score_scale: float = 3.5
+    rescale_window: int = 40
+    ex_ante_vol_window: int = 5
+    size_k: float = 1.5
     size_max: float = 1.0
-    ex_ante_vol_window: int = 10
-    restrict_short_on_peak_prob: float = 0.3
-    rescale_window: int = 60
-    score_scale: float = 2.5
+    restrict_short_on_peak_prob: float = 0.25
     use_rescaled_score: bool = True
+
 
 
 @dataclass
@@ -421,19 +419,19 @@ class M002FullArchitecture:
     # ---------- Policy ----------
 
     def _apply_policy(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Map soft score to {LONG, FLAT, SHORT} and size positions."""
-        cfg = self.policy_cfg
+        """Adaptive threshold policy application (balanced signal distribution)."""
         out = df.copy()
 
-        # ex-ante volatility (ATR-smooth rolling mean)
+        # === 1️⃣ ex-ante volatility 계산 ===
         out["ex_ante_vol"] = (
             out.groupby("ticker")["atr_smooth"]
-            .transform(lambda s: s.rolling(cfg.ex_ante_vol_window, min_periods=1).mean())
+            .transform(lambda s: s.rolling(self.policy_cfg.ex_ante_vol_window, min_periods=1).mean())
             .replace(0.0, np.nan)
         )
 
-        if cfg.use_rescaled_score:
-            window = max(cfg.rescale_window, 20)
+        # === 2️⃣ score rescaling ===
+        if self.policy_cfg.use_rescaled_score:
+            window = max(self.policy_cfg.rescale_window, 20)
 
             def _rolling_z(series: pd.Series) -> pd.Series:
                 roll = series.rolling(window, min_periods=max(window // 3, 5))
@@ -442,7 +440,7 @@ class M002FullArchitecture:
                 return ((series - mean) / std).fillna(0.0)
 
             out["policy_score_rescaled"] = (
-                out.groupby("ticker")["policy_score"].transform(_rolling_z) * cfg.score_scale
+                out.groupby("ticker")["policy_score"].transform(_rolling_z) * self.policy_cfg.score_scale
             )
             effective_score = out["policy_score_rescaled"]
         else:
@@ -450,32 +448,43 @@ class M002FullArchitecture:
 
         out["effective_score"] = effective_score
 
-        # base position sizing with effective score
-        base = cfg.size_k * effective_score / out["ex_ante_vol"]
-        out["base_position_size"] = np.clip(base, -cfg.size_max, cfg.size_max).fillna(0.0)
+        # === 3️⃣ adaptive threshold 설정 ===
+        valid_scores = out["effective_score"].replace([np.inf, -np.inf], np.nan).dropna()
+        long_q = np.quantile(valid_scores, 1 - self.policy_cfg.target_short_ratio)
+        short_q = np.quantile(valid_scores, self.policy_cfg.target_short_ratio)
+        flat_low = np.quantile(valid_scores, 0.5 - self.policy_cfg.target_flat_ratio / 2)
+        flat_high = np.quantile(valid_scores, 0.5 + self.policy_cfg.target_flat_ratio / 2)
 
+        # === 4️⃣ decision logic ===
         def decide(row: pd.Series) -> str:
             score = float(row["effective_score"])
-            if cfg.theta_flat_low is not None and abs(score) < cfg.theta_flat_low:
-                return "FLAT"
+            peak_prob = float(row.get("state_prob_Peak", 0.0))
 
+            # 이벤트 기반 가중치
             if int(row.get("I_vr_and_vs", 0)) == 1:
                 score *= 0.8
             if int(row.get("I_bd_late", 0)) == 1:
                 score *= 1.1
+            if int(row.get("I_bd_early", 0)) == 1:
+                score *= 1.1
 
-            if score >= cfg.theta_long:
+            # adaptive threshold에 따라 결정
+            if score >= long_q:
                 return "LONG"
-
-            peak_prob = float(row.get("state_prob_Peak", 0.0))
-            if score <= cfg.theta_short and (int(row.get("I_bd_early", 0)) == 1 or peak_prob >= cfg.restrict_short_on_peak_prob):
+            elif score <= short_q or (peak_prob >= self.policy_cfg.restrict_short_on_peak_prob and score < flat_low):
                 return "SHORT"
-
-            return "FLAT"
+            elif flat_low < score < flat_high:
+                return "FLAT"
+            else:
+                return "FLAT"
 
         out["action"] = out.apply(decide, axis=1)
-        out["position_size"] = np.where(out["action"] == "FLAT", 0.0, out["base_position_size"])
-        out["position_size"] = np.clip(out["position_size"], -cfg.size_max, cfg.size_max)
+
+        # === 5️⃣ 포지션 사이즈 계산 ===
+        base = self.policy_cfg.size_k * effective_score / out["ex_ante_vol"]
+        out["position_size"] = np.where(out["action"] == "FLAT", 0.0, base)
+        out["position_size"] = np.clip(out["position_size"], -self.policy_cfg.size_max, self.policy_cfg.size_max).fillna(0.0)
+
         return out
 
     # ---------- Inference ----------
