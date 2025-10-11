@@ -16,8 +16,6 @@ from sklearn.multioutput import MultiOutputRegressor
 import lightgbm as lgb
 
 from data.dataset_builder import build_dataset
-
-
 DEFAULT_FEATURES: Sequence[str] = (
     # Event primitives & combinations
     "event_local_vol_spike",
@@ -181,8 +179,19 @@ class M002MultiTaskModel:
         df_pd = df_pl.select(output_cols).to_pandas()
         return df_pd
 
-    def train(self) -> Dict[str, float]:
-        data = self._build_dataframe()
+    def train(self, data: Optional[pd.DataFrame] = None) -> Dict[str, float]:
+        ret_col = f"ret_{self.config.horizon}d_pct"
+        dd_col = f"dd_{self.config.horizon}d_pct"
+
+        if data is None:
+            data = self._build_dataframe()
+        else:
+            missing = [col for col in self.feature_columns if col not in data.columns]
+            required_targets = {ret_col, dd_col, "label_rebound_bin"}
+            missing_targets = [col for col in required_targets if col not in data.columns]
+            if missing or missing_targets:
+                raise ValueError(f"Provided data is missing required columns: features={missing}, targets={missing_targets}")
+            data = data.copy()
 
         train_df, valid_df = train_test_split(
             data,
@@ -196,8 +205,8 @@ class M002MultiTaskModel:
         y_train_cls = train_df["label_rebound_bin"]
         y_valid_cls = valid_df["label_rebound_bin"]
 
-        y_train_reg = train_df[["ret_5d_pct", "dd_5d_pct"]]
-        y_valid_reg = valid_df[["ret_5d_pct", "dd_5d_pct"]]
+        y_train_reg = train_df[[ret_col, dd_col]]
+        y_valid_reg = valid_df[[ret_col, dd_col]]
 
         # NaN 값 제거 (안전장치)
         nan_mask_train = y_train_reg.isna().any(axis=1)
@@ -224,10 +233,10 @@ class M002MultiTaskModel:
 
         cls_pred_prob = self.classifier.predict_proba(X_valid)[:, 1]
         reg_pred = self.regressor.predict(X_valid)
-        ret_pred = reg_pred[:, 0] / 100.0  # 퍼센트를 소수점으로 변환
-        dd_pred = reg_pred[:, 1] / 100.0  # 퍼센트를 소수점으로 변환
+        ret_pred = reg_pred[:, 0]
+        dd_pred = reg_pred[:, 1]
 
-        policy_score = cls_pred_prob * ret_pred - self.config.risk_aversion * np.maximum(0.0, -dd_pred)
+        policy_score = cls_pred_prob * (ret_pred / 100.0) - self.config.risk_aversion * np.maximum(0.0, -(dd_pred / 100.0))
 
         metrics = {
             "valid_avg_precision": average_precision_score(y_valid_cls, cls_pred_prob),
