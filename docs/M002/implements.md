@@ -47,7 +47,7 @@
   - 각 배치 내에서 클래스별 oversampling: 소수 클래스를 repetition으로 균형 맞춤.
   - `WeightedRandomSampler` 대신 배치 수준 균형으로 학습 안정성 향상.
 - `train()`:
-  - AdamW, CrossEntropyLoss (weight=None, label_smoothing=0.15), max_epochs=15.
+  - AdamW, CrossEntropyLoss (weight=None, label_smoothing=0.08), max_epochs=15.
   - 최적 validation loss snapshot 저장.
   - 반환: train/valid loss, accuracy, 시퀀스 수.
 
@@ -94,16 +94,15 @@
 
 ### 4.2 추가 규칙
 - `_apply_policy()`:
-  - `atr_smooth` 기반 `ex_ante_vol` (rolling mean 10일).
-  - 포지션 사이징: `size = clip(k * score / ex_ante_vol, [-size_max, size_max])`.
+  - `atr_smooth` 기반 `ex_ante_vol` (rolling mean 5일).
+  - 롤링 Z-score(`rescale_window=60`) 후 `score_scale=2.5` 배 스케일링 → 시그널 분포의 fat-tail 완화.
   - 이벤트 기반 보정:
-    - `I_vr_and_vs` → score 0.8배 (과열).
-    - `I_bd_late` → score 1.1배 (롱 강화).
-  - 의사결정 분기:
-    - Score ≥ θ_long → LONG
-    - Score ≤ θ_short & (`I_bd_early` or Peak prob ≥ threshold) → SHORT
-    - 나머지 → FLAT
-  - 최종 `position_size`는 양수 롱 / 음수 숏 / 0 플랫.
+    - `I_vr_and_vs` → score 0.8배 (과열 완화).
+    - `I_bd_late` → score 1.1배 (바닥 리바운드 강화).
+  - 적응형 의사결정:
+    - `target_short_ratio=0.1`, `target_flat_ratio=0.45` 비율을 기준으로 score 분포의 분위수(quantile)에서 LONG/SHORT/FLOAT 경계 자동 계산.
+    - Peak 확률이 `restrict_short_on_peak_prob=0.35` 이상이면 숏 진입을 억제.
+  - 포지션 사이징: `size = clip(k * score / ex_ante_vol, [-size_max, size_max])` (기본 `k=1.2`, `size_max=1.0`).
 
 ### 4.3 추론 출력 (`predict`)
 - 입력: 이미 `m002` 피처를 갖고 있는 `pl.DataFrame`.

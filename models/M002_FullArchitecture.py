@@ -55,6 +55,32 @@ HEAD_FEATURES: Sequence[str] = tuple(
 # Helpers
 # ---------------------------
 
+
+def _format_year_segment(start: int, end: int) -> str:
+    return str(start) if start == end else f"{start}-{end}"
+
+
+def years_to_slug(years: Sequence[int]) -> str:
+    """Condense a collection of years into a compact slug (handles contiguous spans)."""
+    unique_years = sorted({int(year) for year in years})
+    if not unique_years:
+        return "unknown-years"
+
+    segments: List[str] = []
+    segment_start = unique_years[0]
+    previous = unique_years[0]
+
+    for year in unique_years[1:]:
+        if year == previous + 1:
+            previous = year
+            continue
+        segments.append(_format_year_segment(segment_start, previous))
+        segment_start = previous = year
+
+    segments.append(_format_year_segment(segment_start, previous))
+    return "_".join(segments)
+
+
 def _compute_future_returns(df: pl.DataFrame, horizon: int) -> pl.DataFrame:
     """Attach future return and future drawdown (min-close path) over the next horizon days."""
     g = "ticker"
@@ -90,15 +116,16 @@ def _soft_policy_score(prob: np.ndarray, ret_pct: np.ndarray, dd_pct: np.ndarray
 # ---------------------------
 @dataclass
 class PolicyConfig:
-    target_flat_ratio: float = 0.4
-    target_short_ratio: float = 0.15
-    score_scale: float = 3.5
-    rescale_window: int = 40
+    target_flat_ratio: float = 0.45
+    target_short_ratio: float = 0.1
+    score_scale: float = 2.5
+    rescale_window: int = 60
     ex_ante_vol_window: int = 5
-    size_k: float = 1.5
+    size_k: float = 1.2
     size_max: float = 1.0
-    restrict_short_on_peak_prob: float = 0.25
+    restrict_short_on_peak_prob: float = 0.35
     use_rescaled_score: bool = True
+    risk_aversion: float = 0.5
 
 
 
@@ -139,6 +166,8 @@ class M002FullArchitecture:
         self.config = config or FullArchitectureConfig()
         self.regime = M002RegimeClassifier(self.config.regime)
         self.policy_cfg = self.config.policy
+        if getattr(self.policy_cfg, "risk_aversion", None) is None:
+            self.policy_cfg.risk_aversion = getattr(self.config.multitask, "risk_aversion", 0.5)
 
         self.head_model: Optional[lgb.LGBMClassifier] = None
         self.head_multi: Optional[MultiOutputRegressor] = None
@@ -577,7 +606,8 @@ def main() -> Dict[str, Dict[str, float]]:
         import joblib
         save_dir = Path("models/saved")
         save_dir.mkdir(parents=True, exist_ok=True)
-        model_path = save_dir / f"m002_full_architecture_{config.multitask.market}_{'_'.join(map(str, config.multitask.years))}.pkl"
+        year_slug = years_to_slug(config.multitask.years)
+        model_path = save_dir / f"m002_full_architecture_{config.multitask.market}_{year_slug}.pkl"
         joblib.dump(model, model_path)
     except Exception:
         # Silently ignore persistence failures in quiet mode
@@ -596,4 +626,5 @@ __all__ = [
     "M002FullArchitecture",
     "FullArchitectureConfig",
     "PolicyConfig",
+    "years_to_slug",
 ]

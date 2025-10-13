@@ -8,7 +8,7 @@ Usage (example):
         --tickers AAPL MSFT \\
         --start 2020-01-01 \\
         --end 2024-01-01 \\
-        --model-path models/saved/m002_full_architecture_US_2010_2011_2012_2013_2014_2015_2016_2017_2018.pkl \\
+        --model-path models/saved/m002_full_architecture_US_2000-2018.pkl \\
         --save-csv reports/m002_yf_scores.csv
 
 The script will:
@@ -30,18 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 import glob
 
-import matplotlib
-# Try different backends for GUI support
-backends = ['TkAgg', 'Qt5Agg', 'Qt4Agg', 'Agg']
-for backend in backends:
-    try:
-        matplotlib.use(backend)
-        break
-    except ImportError:
-        continue
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-from matplotlib.patches import Rectangle
+# matplotlib is imported by backtesting.py when needed
 
 import pandas as pd
 import polars as pl
@@ -51,10 +40,140 @@ try:  # yfinance is listed in requirements, keep a clear error if missing
 except ImportError as exc:  # pragma: no cover - surfaced at runtime
     raise SystemExit("yfinance is required. Install it with `pip install yfinance`.") from exc
 
+
 try:
     import joblib
 except ImportError:  # pragma: no cover - instruct the caller to add dependency
     joblib = None
+
+try:
+    from backtesting import Backtest, Strategy
+    from backtesting.lib import crossover
+
+    class M002BacktestStrategy(Strategy):
+        """
+        M002 model signals based backtesting strategy using backtesting.py
+
+        This strategy follows the action signals from the M002 model:
+        - LONG: Enter long position
+        - SHORT: Enter short position (close long if exists, then short)
+        - FLAT: Close any open position
+        """
+
+        def init(self):
+            """Initialize strategy - called once before backtest starts"""
+            pass  # Signals are accessed directly from self.data in next()
+
+        def next(self):
+            """
+            Main strategy logic - called for each candle/bar
+
+            backtesting.py provides self.data as a pandas Series-like object
+            with OHLCV + custom columns (including our 'action' column)
+            """
+            # Get the latest action signal
+            current_signal = self.data['action'][-1]
+
+            if current_signal == 'LONG':
+                # Enter long position if not already in one
+                if not self.position:
+                    self.buy()
+
+            elif current_signal == 'SHORT':
+                # Enter short position
+                if not self.position:
+                    #self.sell()
+                    pass
+                elif self.position.is_long:
+                    # Close long position first, then enter short
+                    self.position.close()
+                    #self.sell()
+
+            elif current_signal == 'FLAT':
+                # Close any open position
+                if self.position:
+                    #self.position.close()
+                    pass
+
+except ImportError:
+    Backtest = None
+    Strategy = None
+    M002BacktestStrategy = None
+
+
+def run_backtest(df: pl.DataFrame) -> tuple[Dict[str, float], any]:
+    """
+    Run backtest using backtesting.py and return metrics and bt object.
+    Falls back to basic calculations if backtesting.py fails.
+    """
+    df_pd = df.to_pandas()
+    df_pd['date'] = pd.to_datetime(df_pd['date'])
+
+    # Basic metrics (always available)
+    metrics = {}
+    if len(df_pd) > 1:
+        initial_price = df_pd['close'].iloc[0]
+        final_price = df_pd['close'].iloc[-1]
+        total_return = ((final_price - initial_price) / initial_price) * 100
+
+        metrics.update({
+            'initial_price': float(initial_price),
+            'final_price': float(final_price),
+            'total_return_pct': float(total_return),
+            'data_points': len(df_pd),
+            'start_date': df_pd['date'].min().strftime('%Y-%m-%d'),
+            'end_date': df_pd['date'].max().strftime('%Y-%m-%d'),
+        })
+
+    # Signal analysis
+    if 'action' in df_pd.columns:
+        long_count = (df_pd['action'] == 'LONG').sum()
+        short_count = (df_pd['action'] == 'SHORT').sum()
+        flat_count = (df_pd['action'] == 'FLAT').sum()
+        metrics.update({
+            'long_signals': int(long_count),
+            'short_signals': int(short_count),
+            'flat_signals': int(flat_count),
+        })
+
+    bt = None
+    # Use backtesting.py for comprehensive metrics
+    if Backtest is not None and Strategy is not None and M002BacktestStrategy is not None:
+        try:
+            bt_data = df_pd.set_index('date')[['open', 'high', 'low', 'close', 'volume']].copy()
+            # Rename columns to match backtesting.py requirements
+            bt_data.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+            # Add action column for strategy access
+            bt_data['action'] = df_pd.set_index('date')['action']
+            bt = Backtest(bt_data, M002BacktestStrategy, cash=10000, commission=.002)
+            result = bt.run()
+
+            # Extract key metrics
+            backtest_metrics = {
+                'return_pct': result.get('Return [%]', 0),
+                'buy_and_hold_return_pct': result.get('Buy & Hold Return [%]', 0),
+                'sharpe_ratio': result.get('Sharpe Ratio', 0),
+                'max_drawdown_pct': result.get('Max. Drawdown [%]', 0),
+                'win_rate_pct': result.get('Win Rate [%]', 0),
+                'total_trades': result.get('# Trades', 0),
+                'equity_final': result.get('Equity Final [$]', 10000),
+                'equity_peak': result.get('Equity Peak [$]', 10000),
+            }
+
+            # Convert types
+            for key, value in backtest_metrics.items():
+                if hasattr(value, 'item'):
+                    backtest_metrics[key] = value.item()
+
+            metrics.update(backtest_metrics)
+            logging.info("Successfully calculated backtest metrics using backtesting.py")
+
+        except Exception as e:
+            logging.warning(f"backtesting.py failed: {e}")
+            logging.info("Falling back to basic metrics")
+
+    return metrics, bt
+
 
 from features.feature_sets import add_feature_set
 from models.M002_MultiTask import M002TrainingConfig
@@ -292,156 +411,68 @@ def merge_predictions(
     return combined
 
 
-def create_trading_chart(merged_df: pl.DataFrame, ticker: str, save_path: Optional[Path] = None) -> None:
-    """Create a trading chart with price, positions, and performance metrics."""
-    # Convert to pandas for easier plotting
-    df = merged_df.to_pandas()
-    df['date'] = pd.to_datetime(df['date'])
-
-    # Create figure with subplots - professional styling
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 12), height_ratios=[3, 1])
-    fig.suptitle(f'📈 {ticker} Trading Analysis - M002 Model', fontsize=18, fontweight='bold', y=0.95)
-
-    # Set background colors
-    fig.patch.set_facecolor('white')
-    ax1.set_facecolor('#f8f9fa')
-    ax2.set_facecolor('#f8f9fa')
-
-    # Main price chart
-    ax1.plot(df['date'], df['close'], linewidth=2, label='Close Price', color='navy')
-
-    # Add moving averages for reference
-    if len(df) > 20:
-        df['MA20'] = df['close'].rolling(window=20).mean()
-        ax1.plot(df['date'], df['MA20'], linewidth=1, label='20-day MA', color='orange', linestyle='--')
-
-    if len(df) > 50:
-        df['MA50'] = df['close'].rolling(window=50).mean()
-        ax1.plot(df['date'], df['MA50'], linewidth=1, label='50-day MA', color='purple', linestyle='--')
-
-    # Add position signals with background highlighting
-    if 'action' in df.columns:
-        # Create background colors for different positions
-        colors = {'LONG': 'lightgreen', 'SHORT': 'lightcoral', 'FLAT': 'lightgray'}
-
-        # Group consecutive signals for background highlighting
-        df['action_group'] = (df['action'] != df['action'].shift()).cumsum()
-
-        for action in ['LONG', 'SHORT']:  # Only highlight LONG and SHORT periods
-            action_data = df[df['action'] == action]
-            if action_data.empty:
-                continue
-
-            # Background highlighting for position periods
-            for _, group in action_data.groupby('action_group'):
-                if len(group) > 1:  # Only highlight if more than 1 consecutive day
-                    start_date = group['date'].min()
-                    end_date = group['date'].max()
-                    ax1.axvspan(start_date, end_date, alpha=0.2, color=colors[action],
-                               label=f'{action} Period' if f'{action} Period' not in [l.get_label() for l in ax1.patches] else "")
-
-        # Signal markers on price chart
-        long_signals = df[df['action'] == 'LONG']
-        if not long_signals.empty:
-            ax1.scatter(long_signals['date'], long_signals['close'],
-                       marker='^', color='green', s=120, label='LONG Signal',
-                       edgecolors='black', linewidth=1, zorder=6)
-
-        short_signals = df[df['action'] == 'SHORT']
-        if not short_signals.empty:
-            ax1.scatter(short_signals['date'], short_signals['close'],
-                       marker='v', color='red', s=120, label='SHORT Signal',
-                       edgecolors='black', linewidth=1, zorder=6)
 
 
-    ax1.set_ylabel('Price ($)', fontsize=14, fontweight='bold')
-    ax1.legend(loc='upper left', fontsize=12, framealpha=0.9)
-    ax1.grid(True, alpha=0.4, linestyle='--')
-    ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-    plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, fontsize=10)
+def generate_backtest_filename(ticker: str, start_date: str, end_date: str, reports_dir: Path = Path("reports")) -> Path:
+    """Generate a filename for backtest results including ticker and date range."""
+    start_year = start_date.split('-')[0]
+    end_year = end_date.split('-')[0]
+    filename = f"{ticker}_{start_year}_{end_year}_backtest_results.json"
+    return reports_dir / filename
 
-    # Remove x-axis labels from top chart
-    ax1.set_xlabel('')
 
-    # Performance metrics subplot
-    if 'policy_score' in df.columns:
-        ax2.plot(df['date'], df['policy_score'], linewidth=2, label='Policy Score', color='purple')
+def save_backtest_results(ticker: str, metrics: Dict[str, float], start_date: str, end_date: str, model_path: Path) -> None:
+    """Save backtest performance metrics to a JSON file in reports/ directory."""
+    reports_dir = Path("reports")
+    reports_dir.mkdir(exist_ok=True)
 
-        # Add threshold lines
-        ax2.axhline(y=0.5, color='red', linestyle='--', alpha=0.7, label='Neutral Threshold')
-        ax2.axhline(y=0.7, color='green', linestyle='--', alpha=0.7, label='Strong Signal')
-
-    ax2.set_ylabel('Policy Score', fontsize=14, fontweight='bold')
-    ax2.set_xlabel('Date', fontsize=12)
-    ax2.legend(loc='upper left', fontsize=12, framealpha=0.9)
-    ax2.grid(True, alpha=0.4, linestyle='--')
-    ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-    plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45, fontsize=10)
-
-    # Calculate and display performance metrics
-    if len(df) > 1:
-        initial_price = df['close'].iloc[0]
-        final_price = df['close'].iloc[-1]
-        total_return = ((final_price - initial_price) / initial_price) * 100
-
-        # Enhanced signal analysis
-        if 'action' in df.columns:
-            long_count = (df['action'] == 'LONG').sum()
-            short_count = (df['action'] == 'SHORT').sum()
-            flat_count = (df['action'] == 'FLAT').sum()
-
-            # Calculate position changes for trade analysis
-            df['position_change'] = df['action'] != df['action'].shift()
-            trade_signals = df[df['position_change'] & (df['action'] != 'FLAT')]
-            total_trades = len(trade_signals)
-
-            # Calculate win rate (simplified: assuming LONG beats buy&hold in bull periods)
-            if total_trades > 0:
-                # Simple win rate based on position direction vs price movement
-                wins = 0
-                for i in range(1, len(df)):
-                    if df['action'].iloc[i-1] == 'LONG' and df['close'].iloc[i] > df['close'].iloc[i-1]:
-                        wins += 1
-                    elif df['action'].iloc[i-1] == 'SHORT' and df['close'].iloc[i] < df['close'].iloc[i-1]:
-                        wins += 1
-                win_rate = (wins / len(df)) * 100 if len(df) > 0 else 0
-            else:
-                win_rate = 0.0
+    # Convert numpy/pandas types to Python native types for JSON serialization
+    def convert_to_python_types(obj):
+        if isinstance(obj, dict):
+            return {key: convert_to_python_types(value) for key, value in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [convert_to_python_types(item) for item in obj]
+        elif hasattr(obj, 'item'):  # numpy scalar
+            return obj.item()
         else:
-            long_count = short_count = flat_count = total_trades = 0
-            win_rate = 0.0
+            return obj
 
-        # Add metrics text
-        metrics_text = f"""
-        📊 Performance Metrics:
-        Initial Price: ${initial_price:.2f}
-        Final Price: ${final_price:.2f}
-        Total Return: {total_return:+.2f}%
+    backtest_data = {
+        "metadata": {
+            "ticker": ticker,
+            "start_date": start_date,
+            "end_date": end_date,
+            "model_path": str(model_path),
+            "generated_at": datetime.now().isoformat(),
+            "model_name": "M002_Full_Architecture"
+        },
+        "performance_metrics": convert_to_python_types(metrics)
+    }
 
-        📈 Trading Signals:
-        LONG: {long_count}  SHORT: {short_count}  FLAT: {flat_count}
-        Total Trades: {total_trades}
-        Signal Accuracy: {win_rate:.1f}%
-        Data Points: {len(df)}
-        """
+    filename = generate_backtest_filename(ticker, start_date, end_date)
+    with filename.open("w", encoding="utf-8") as f:
+        json.dump(backtest_data, f, indent=2, ensure_ascii=False)
 
-        fig.text(0.02, 0.98, metrics_text, fontsize=10, verticalalignment='top',
-                bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.9))
+    logging.info(f"Backtest results saved to {filename}")
 
-    plt.tight_layout()
 
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        logging.info(f"Chart saved to {save_path}")
-    else:
-        try:
-            plt.show(block=True)
-            logging.info("Chart displayed. Close the window to continue.")
-        except Exception as e:
-            logging.warning(f"Could not display chart interactively: {e}")
-            logging.info("Try using --save-chart option instead to save chart as image file.")
+def create_chart(df: pl.DataFrame, ticker: str, bt: any, save_path: Optional[Path] = None) -> None:
+    """Create a trading chart using backtesting.py's built-in plotting."""
+    if bt is None:
+        logging.warning("No backtest object available for charting")
+        return
 
-    plt.close()
+    try:
+        if save_path:
+            bt.plot(filename=str(save_path), open_browser=False)
+            logging.info(f"Chart saved to {save_path}")
+        else:
+            bt.plot(open_browser=False)
+            logging.info("Chart displayed")
+    except Exception as e:
+        logging.warning(f"Could not create chart: {e}")
+
+
 
 
 def parse_args() -> argparse.Namespace:
@@ -475,7 +506,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-csv", type=Path, help="Optional CSV output path for merged predictions.")
     parser.add_argument("--save-parquet", type=Path, help="Optional Parquet output path for merged predictions.")
     parser.add_argument("--save-chart", type=Path, help="Optional chart output path (PNG format).")
-    parser.add_argument("--show-chart", action="store_true", help="Show interactive chart in window.")
+    parser.add_argument("--show-chart", action="store_true", help="Show chart using backtesting.py.")
+    parser.add_argument("--run-backtest", action="store_true", help="Run backtest and save performance metrics to reports/ folder.")
     parser.add_argument("--log-level", default="INFO", help="Python logging level (e.g. INFO, DEBUG).")
     return parser.parse_args()
 
@@ -585,17 +617,29 @@ def main() -> None:
         result_df = merged.select(available_cols).to_pandas()
         logging.info("\n%s", result_df.to_string(index=False))
 
-    # Create charts for each ticker
-    if args.save_chart or args.show_chart:
+    # Create charts and run backtests for each ticker
+    if args.save_chart or args.show_chart or args.run_backtest:
         unique_tickers = merged.select("ticker").unique().to_series().to_list()
         for ticker in unique_tickers:
             ticker_data = merged.filter(pl.col("ticker") == ticker)
+
+            # Run backtest and get metrics + bt object
+            metrics, bt = run_backtest(ticker_data)
+
+            # Create chart if requested
             if args.save_chart:
                 chart_path = args.save_chart.parent / f"{args.save_chart.stem}_{ticker}{args.save_chart.suffix}"
-                create_trading_chart(ticker_data, ticker, chart_path)
+                create_chart(ticker_data, ticker, bt, chart_path)
             elif args.show_chart:
-                create_trading_chart(ticker_data, ticker, None)
+                create_chart(ticker_data, ticker, bt, None)
 
+            # Save backtest results if requested
+            if args.run_backtest:
+                save_backtest_results(ticker, metrics, args.start, args.end, model_path)
+                # Also save chart when running backtest
+                chart_filename = f"{ticker}_{args.start.split('-')[0]}_{args.end.split('-')[0]}_backtest_chart.html"
+                chart_path = Path("reports") / chart_filename
+                create_chart(ticker_data, ticker, bt, chart_path)
 
 if __name__ == "__main__":
     main()

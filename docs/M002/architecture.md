@@ -12,7 +12,7 @@
    - 라벨: `_assign_regime_labels()`가 규칙 기반으로 `Accumulation/EarlyUp/Peak/Distribution/LateDown`을 부여. LateDown은 `I_bd_late`와 곡률·모멘텀 조합으로 확대하여 U형 하단 후보를 더 넓게 포착합니다.  
    - 학습: PyTorch LSTM + FC. 클래스 불균형을 완화하기 위해  
      * `balance_classes=True`일 때 inverse-frequency 가중치(`class_weight_power`)를 CrossEntropyLoss와 `WeightedRandomSampler`에 적용  
-     * `label_smoothing`(기본 0.05)으로 노이즈를 줄입니다.  
+     * `label_smoothing`(기본 0.08)으로 노이즈를 줄입니다.  
    - 출력: `predict_probabilities()`가 티커/날짜별 `state_prob_{name}` 벡터를 생성.
 
 3. **Multi-task Head + Policy Layer** – `models/M002_FullArchitecture.py`
@@ -33,12 +33,14 @@
    ### 3.3 Policy Layer
    - 기본 스코어: `Score = P_up * (E_ret/100) - λ * max(0, -(E_dd/100))` (λ=`risk_aversion`)  
    - `PolicyConfig` 주요 파라미터  
-     * `theta_long=0.05`, `theta_short=-0.05`, `theta_flat_low=0.0`  
-     * `rescale_window=60`, `score_scale=2.5`: 티커별 롤링 Z-score로 `policy_score_rescaled`를 생성해 분포를 확대  
-     * `restrict_short_on_peak_prob`: Peak 확률이 높을 때만 숏 허용  
+     * `rescale_window=60`, `score_scale=2.5`: 티커별 롤링 Z-score 기반 재스케일링  
+     * `target_flat_ratio=0.45`, `target_short_ratio=0.1`: score 분포 분위수를 기반으로 FLOP/LONG/SHORT 비중을 자동 제어  
+     * `restrict_short_on_peak_prob=0.35`: Peak 확률이 높을 때 숏 비중 제한  
+     * `risk_aversion=0.5`: 정책 스코어에서 드로다운 패널티 가중치  
+     * `size_k=1.2`, `size_max=1.0`: ex-ante 볼랏 대비 레버리지와 클리핑
    - `_apply_policy()`  
-     * `atr_smooth` 기반 ex-ante volatility로 포지션 사이징  
-     * `I_vr_and_vs`는 과열 시그널로 0.8배 축소, `I_bd_late`가 있으면 1.1배 확대  
+     * `atr_smooth` 롤링 평균(5일)로 ex-ante volatility 추정  
+     * `I_vr_and_vs`는 과열 시그널로 0.8배 축소, `I_bd_late`·`I_bd_early`는 저점 리스크 완화장치  
      * 최종 `action ∈ {LONG, FLAT, SHORT}`, `position_size`는 `[-size_max, size_max]`로 클리핑.
 
 ---
@@ -82,6 +84,6 @@ pred = arch.predict(feature_polars_df)
 ## 체크포인트
 - Regime LSTM: 클래스 분포·가중치가 `metrics['class_counts']`, `metrics['class_weights']`로 로그됩니다.  
 - Head 튜닝: `tune_head_hyperparams` 결과가 `best_head_params` / `best_head_metrics`에 저장됩니다.  
-- Policy Score: `_apply_policy`가 리스케일 후 스코어 분포를 자동 조절하므로, 필요하면 `score_scale`·`theta_*` 값을 조정하세요.
+- Policy Score: `_apply_policy`가 리스케일 후 스코어 분포를 자동 조절하므로, 필요하면 `score_scale`·`target_*_ratio` 값을 조정하세요.
 
 이 구조를 통해 이벤트 시퀀스 → 탭형 예측 → 정책 의사결정이 명확히 분리되어, 각 계층을 독립적으로 튜닝하거나 교체할 수 있습니다.

@@ -421,7 +421,7 @@ def main():
     import joblib
 
     # 저장된 모델 파일 경로
-    model_path = "models/saved/m002_multitask_US_2010_2011_2012_2013_2014_2015_2016_2017_2018.pkl"
+    model_path = "models/saved/m002_multitask_US_2000-2018.pkl"
 
     try:
         # 모델 로드
@@ -441,7 +441,7 @@ def main():
         # 모델이 없으면 새로 학습
         config = M002TrainingConfig(
             market="US",
-            years=list(range(2010, 2019)),
+            years=list(range(2000, 2019)),
             horizon=5,
             rebound_thresh=1.0,
             drawdown_floor=-3.0
@@ -499,4 +499,3 @@ if __name__ == "__main__":
         print(f"\n❌ 오류 발생: {e}")
         import traceback
         traceback.print_exc()
-

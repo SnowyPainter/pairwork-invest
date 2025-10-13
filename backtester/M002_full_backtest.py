@@ -35,7 +35,11 @@ import sys
 sys.path.append(str(Path(__file__).parent.parent))
 
 from data.dataset_builder import build_dataset
-from models.M002_FullArchitecture import M002FullArchitecture, FullArchitectureConfig, PolicyConfig
+from models.M002_FullArchitecture import (
+    M002FullArchitecture,
+    FullArchitectureConfig,
+    years_to_slug,
+)
 from models.M002_MultiTask import M002TrainingConfig
 from models.M002_RegimeClassifier import M002RegimeClassifier, RegimeConfig
 
@@ -96,7 +100,7 @@ class M002FullBacktester:
     def prepare_data(
         self,
         market: str = "US",
-        years: List[int] = list(range(2010, 2019)),
+        years: List[int] = list(range(2000, 2019)),
         max_tickers: int = 100
     ) -> pl.DataFrame:
         print(f"[데이터 준비] market={market}, years={years}, max_tickers={max_tickers}")
@@ -266,7 +270,7 @@ class M002FullBacktester:
     def run(
         self,
         market: str = "US",
-        years: List[int] = list(range(2010, 2019)),
+        years: List[int] = list(range(2000, 2019)),
         max_tickers: int = 1000,
         save_dir: str = "reports/m002_full_backtest_btpy"
     ) -> pd.DataFrame:
@@ -336,8 +340,8 @@ def main():
     import joblib
 
 
-    model_years = list(map(str, M002TrainingConfig().years))
-    model_path = f"models/saved/m002_full_architecture_US_{'_'.join(model_years)}.pkl"
+    year_slug = years_to_slug(M002TrainingConfig().years)
+    model_path = f"models/saved/m002_full_architecture_US_{year_slug}.pkl"
 
     try:
         model = joblib.load(model_path)
@@ -359,7 +363,7 @@ def main():
         model = M002FullArchitecture(config=config)
 
         train_df = build_dataset(
-            years=list(range(2010, 2019)),
+            years=list(config.multitask.years),
             market="US",
             max_tickers=100,
             feature_set=config.feature_set,
@@ -386,7 +390,7 @@ def main():
 
     stats_df = backtester.run(
         market="US",
-        years=list(range(2010, 2019)),
+        years=list(model.config.multitask.years),
         max_tickers=100,  # 더 많은 티커 시도
         save_dir="reports/m002_full_backtest_btpy"
     )

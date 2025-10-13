@@ -209,11 +209,11 @@ class RegimeConfig:
     valid_ratio: float = 0.2
     normalize_features: bool = True
     market: str = "US"
-    years: Sequence[int] = field(default_factory=lambda: list(range(2010, 2019)))
+    years: Sequence[int] = field(default_factory=lambda: list(range(2000, 2019)))
     random_seed: int = 42
     balance_classes: bool = True
     class_weight_power: float = 0.5
-    label_smoothing: float = 0.15
+    label_smoothing: float = 0.08
 
     def device(self) -> torch.device:
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")

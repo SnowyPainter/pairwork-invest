@@ -1,0 +1,29 @@
+{
+  "metadata": {
+    "ticker": "AAPL",
+    "start_date": "2024-10-13",
+    "end_date": "2025-10-13",
+    "model_path": "models/saved/m002_full_architecture_US_2000-2018.pkl",
+    "generated_at": "2025-10-13T17:56:25.255424",
+    "model_name": "M002_Full_Architecture"
+  },
+  "performance_metrics": {
+    "initial_price": 230.228515625,
+    "final_price": 245.27000427246094,
+    "total_return_pct": 6.533286550811439,
+    "data_points": 249,
+    "start_date": "2024-10-14",
+    "end_date": "2025-10-10",
+    "long_signals": 19,
+    "short_signals": 19,
+    "flat_signals": 152,
+    "return_pct": 7.907259270303547,
+    "buy_and_hold_return_pct": 6.533286550811439,
+    "sharpe_ratio": 0.2647407570367106,
+    "max_drawdown_pct": -27.821538421434468,
+    "win_rate_pct": 60.0,
+    "total_trades": 5,
+    "equity_final": 10790.725927030355,
+    "equity_peak": 10848.283791898519
+  }
+}

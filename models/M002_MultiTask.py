@@ -62,7 +62,7 @@ DEFAULT_FEATURES: Sequence[str] = (
 @dataclass
 class M002TrainingConfig:
     market: str = "US"
-    years: Sequence[int] = field(default_factory=lambda: list(range(2010, 2019)))
+    years: Sequence[int] = field(default_factory=lambda: list(range(2000, 2019)))
     horizon: int = 5
     rebound_thresh: float = 1.0
     drawdown_floor: float = -3.0

@@ -12,3 +12,4 @@ plotly>=5.15.0
 yfinance>=0.2.0
 optuna>=3.4.0
 vectorbt>=0.26.0
+backtesting>=0.7.0
