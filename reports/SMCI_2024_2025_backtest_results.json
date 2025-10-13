@@ -1,0 +1,29 @@
+{
+  "metadata": {
+    "ticker": "SMCI",
+    "start_date": "2024-10-13",
+    "end_date": "2025-10-13",
+    "model_path": "models/saved/m002_full_architecture_US_2000-2018.pkl",
+    "generated_at": "2025-10-13T18:07:35.043238",
+    "model_name": "M002_Full_Architecture"
+  },
+  "performance_metrics": {
+    "initial_price": 47.38999938964844,
+    "final_price": 52.86000061035156,
+    "total_return_pct": 11.542522243412302,
+    "data_points": 249,
+    "start_date": "2024-10-14",
+    "end_date": "2025-10-10",
+    "long_signals": 19,
+    "short_signals": 19,
+    "flat_signals": 152,
+    "return_pct": 10.56220730663299,
+    "buy_and_hold_return_pct": 11.542522243412302,
+    "sharpe_ratio": 0.4655477744213997,
+    "max_drawdown_pct": -13.954504317680493,
+    "win_rate_pct": 53.84615384615385,
+    "total_trades": 13,
+    "equity_final": 11056.220730663299,
+    "equity_peak": 11282.34769046402
+  }
+}

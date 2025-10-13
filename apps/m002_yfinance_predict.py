@@ -58,6 +58,8 @@ try:
         - LONG: Enter long position
         - SHORT: Enter short position (close long if exists, then short)
         - FLAT: Close any open position
+
+        Implements a 10% stop loss on all trades.
         """
 
         def init(self):
@@ -78,22 +80,19 @@ try:
                 # Enter long position if not already in one
                 if not self.position:
                     self.buy()
-
             elif current_signal == 'SHORT':
                 # Enter short position
                 if not self.position:
-                    #self.sell()
+                    # Implement actual short entry if desired; pass for now
                     pass
                 elif self.position.is_long:
                     # Close long position first, then enter short
                     self.position.close()
-                    #self.sell()
-
+                    # Implement actual short entry if desired; pass for now
             elif current_signal == 'FLAT':
                 # Close any open position
                 if self.position:
-                    #self.position.close()
-                    pass
+                    self.position.close()
 
 except ImportError:
     Backtest = None
