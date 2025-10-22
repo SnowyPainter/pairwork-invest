@@ -1,0 +1,29 @@
+{
+  "metadata": {
+    "ticker": "TSLA",
+    "start_date": "2024-10-14",
+    "end_date": "2025-10-14",
+    "model_path": "models/saved/m002_full_architecture_US_2000-2018.pkl",
+    "generated_at": "2025-10-14T16:23:54.431415",
+    "model_name": "M002_Full_Architecture"
+  },
+  "performance_metrics": {
+    "initial_price": 219.16000366210938,
+    "final_price": 435.8999938964844,
+    "total_return_pct": 98.89577779371393,
+    "data_points": 250,
+    "start_date": "2024-10-14",
+    "end_date": "2025-10-13",
+    "long_signals": 21,
+    "short_signals": 20,
+    "flat_signals": 150,
+    "return_pct": 3.3551751342773426,
+    "buy_and_hold_return_pct": 98.89577779371393,
+    "sharpe_ratio": 0.15526293489972512,
+    "max_drawdown_pct": -11.869119322137212,
+    "win_rate_pct": 50.0,
+    "total_trades": 10,
+    "equity_final": 10335.517513427734,
+    "equity_peak": 11181.513971008302
+  }
+}

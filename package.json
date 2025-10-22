@@ -21,6 +21,7 @@
     "features:m002:combined": "node scripts/run-python.mjs features/generate_m002_visualizations.py",
     "features:m002:visualize": "node scripts/run-python.mjs features/generate_m002_visualizations.py",
     "features:m002:analyze": "node scripts/run-python.mjs features/analyze_m002_episodes.py",
-    "features:m002:test": "node scripts/run-python.mjs features/test_m002_mark.py"
+    "features:m002:test": "node scripts/run-python.mjs features/test_m002_mark.py",
+    "features:m002:simple": "node scripts/run-python.mjs features/generate_simple_event_plots.py --tickers AAPL --start 2021-01-01 --end 2023-12-31 --output-dir reports/paper_plots"
   }
 }

@@ -607,6 +607,165 @@ class M002FeatureExplorer:
 
         return fig
 
+    def plot_simple_price_with_events(
+        self,
+        ticker: str,
+        *,
+        height: int = 600,
+        width: int = 1000,
+        show_legend: bool = True,
+        font_size: int = 14,
+        use_numeric_xaxis: bool = True,
+    ) -> go.Figure:
+        """
+        Create a simple price chart with 5 event markers for publication-ready visualization.
+
+        Shows price line with colored markers for each of the 5 event types:
+        - Local Vol Spike (Orange star)
+        - Rebound Candidate (Green triangle-up)
+        - Volume Regain (Lime circle)
+        - Exhaustion Candidate (Red triangle-down)
+        - Breakdown Risk (Dark red X)
+        """
+        frame = self.get_feature_frame()
+        subset = frame[frame["ticker"] == ticker.upper()].sort_values("date").copy()
+
+        if subset.empty:
+            raise ValueError(f"No feature rows available for ticker {ticker!r}.")
+
+        # Prepare x-axis data
+        if use_numeric_xaxis:
+            x_data = list(range(len(subset)))  # Use numeric indices 0, 1, 2, ...
+            x_label = "Trading Days"
+        else:
+            x_data = subset["date"]
+            x_label = "Date"
+
+        # Create figure
+        fig = go.Figure()
+
+        # Add price line
+        fig.add_trace(
+            go.Scatter(
+                x=x_data,
+                y=subset["close"],
+                mode="lines",
+                line=dict(color="black", width=2),
+                name="Price",
+                showlegend=show_legend
+            )
+        )
+
+        # Event configurations
+        event_configs = {
+            "event_local_vol_spike": {
+                "name": "Local Vol Spike",
+                "color": "orange",
+                "symbol": "star",
+                "size": 12,
+                "description": "High volatility spike period"
+            },
+            "event_rebound_candidate": {
+                "name": "Rebound Candidate",
+                "color": "green",
+                "symbol": "triangle-up",
+                "size": 12,
+                "description": "Potential rebound signal"
+            },
+            "event_volume_regain": {
+                "name": "Volume Regain",
+                "color": "lime",
+                "symbol": "circle",
+                "size": 10,
+                "description": "Volume recovery signal"
+            },
+            "event_exhaustion_candidate": {
+                "name": "Exhaustion Candidate",
+                "color": "red",
+                "symbol": "triangle-down",
+                "size": 12,
+                "description": "Selling exhaustion signal"
+            },
+            "event_breakdown_risk": {
+                "name": "Breakdown Risk",
+                "color": "darkred",
+                "symbol": "x",
+                "size": 12,
+                "description": "Downside risk signal"
+            }
+        }
+
+        # Add event markers
+        legend_tracker = {}
+        for event_col, config in event_configs.items():
+            if event_col in subset.columns:
+                mask = (subset[event_col].fillna(0) > 0).values
+                if mask.any():
+                    event_name = config["name"]
+                    if event_name not in legend_tracker:
+                        legend_tracker[event_name] = False
+
+                    # Get x data for events (numeric indices or dates)
+                    event_x_data = [x_data[i] for i in range(len(subset)) if mask[i]]
+
+                    fig.add_trace(
+                        go.Scatter(
+                            x=event_x_data,
+                            y=subset.loc[mask, "close"],
+                            mode="markers",
+                            marker=dict(
+                                symbol=config["symbol"],
+                                size=config["size"],
+                                color=config["color"],
+                                line=dict(width=2, color="black")
+                            ),
+                            name=f"{event_name}<br><i>{config['description']}</i>",
+                            showlegend=show_legend and not legend_tracker[event_name],
+                            hovertemplate=f"<b>{event_name}</b><br>{config['description']}<br>Day: %{{x}}<br>Price: %{{y:.2f}}<extra></extra>" if use_numeric_xaxis else f"<b>{event_name}</b><br>{config['description']}<br>Date: %{{x}}<br>Price: %{{y:.2f}}<extra></extra>"
+                        )
+                    )
+                    legend_tracker[event_name] = True
+
+        # Update layout for publication quality
+        fig.update_layout(
+            height=height,
+            width=width,
+            xaxis=dict(
+                title=x_label,
+                title_font=dict(size=font_size),
+                tickfont=dict(size=font_size - 2),
+                tickformat="%Y-%m-%d" if not use_numeric_xaxis else None,
+                dtick="M12" if not use_numeric_xaxis else None,  # Show tick every 12 months (yearly)
+                tickmode="auto" if use_numeric_xaxis else None
+            ),
+            yaxis=dict(
+                title="Price ($)",
+                title_font=dict(size=font_size),
+                tickfont=dict(size=font_size - 2)
+            ),
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.08,
+                x=0.5,
+                xanchor="center",
+                font=dict(size=font_size - 2),
+                bgcolor="rgba(255, 255, 255, 0.9)",
+                bordercolor="black",
+                borderwidth=1
+            ) if show_legend else None,
+            hovermode="x unified",
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+            margin=dict(l=50, r=50, t=120, b=80)
+        )
+
+        # Add grid
+        fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="lightgray")
+        fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="lightgray")
+
+        return fig
+
     def plot_scaled_price_with_events(
         self,
         *,
