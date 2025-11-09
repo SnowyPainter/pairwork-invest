@@ -539,7 +539,7 @@ def main():
         initial_cash=10_000,
         n_jobs=64,
         chart_tickers=chart_tickers,
-        min_hold_bars=1,
+        min_hold_bars=0,
     )
 
     stats_df = backtester.run(
