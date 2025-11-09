@@ -214,6 +214,10 @@ class RegimeConfig:
     balance_classes: bool = True
     class_weight_power: float = 0.5
     label_smoothing: float = 0.08
+    use_walk_forward: bool = True
+    walk_forward_train_ratio: float = 0.7
+    walk_forward_valid_ratio: float = 0.1
+    walk_forward_step_ratio: float = 0.1
 
     def device(self) -> torch.device:
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -400,6 +404,41 @@ class M002RegimeClassifier:
         class_counts = np.bincount(label_array, minlength=self.num_classes)
         return seq_array, label_array, meta_df, class_counts
 
+    def _build_walk_forward_splits(self, num_samples: int) -> List[Tuple[np.ndarray, np.ndarray]]:
+        """Create rolling walk-forward train/valid index pairs."""
+        if num_samples <= 1:
+            return []
+
+        if not self.config.use_walk_forward:
+            split_idx = max(int(num_samples * (1 - self.config.valid_ratio)), 1)
+            train_idx = np.arange(0, split_idx)
+            valid_idx = np.arange(split_idx, num_samples)
+            return [(train_idx, valid_idx)]
+
+        train_size = max(int(num_samples * self.config.walk_forward_train_ratio), 1)
+        valid_size = max(int(num_samples * self.config.walk_forward_valid_ratio), 1)
+        step = max(int(num_samples * self.config.walk_forward_step_ratio), 1)
+        step = max(step, valid_size)
+
+        if train_size + valid_size > num_samples:
+            split_idx = max(num_samples - valid_size, 1)
+            train_idx = np.arange(0, split_idx)
+            valid_idx = np.arange(split_idx, num_samples)
+            return [(train_idx, valid_idx)]
+
+        splits: List[Tuple[np.ndarray, np.ndarray]] = []
+        start = 0
+        while start + train_size + valid_size <= num_samples:
+            train_idx = np.arange(start, start + train_size)
+            valid_idx = np.arange(start + train_size, start + train_size + valid_size)
+            splits.append((train_idx, valid_idx))
+            start += step
+
+        if not splits:
+            split_idx = max(int(num_samples * (1 - self.config.valid_ratio)), 1)
+            splits.append((np.arange(0, split_idx), np.arange(split_idx, num_samples)))
+        return splits
+
     def train(self) -> Dict[str, float]:
         torch.manual_seed(self.config.random_seed)
         np.random.seed(self.config.random_seed)
@@ -408,7 +447,6 @@ class M002RegimeClassifier:
         df_pd = df_pl.select(["ticker", "date", "regime_state_id", *self.feature_columns]).to_pandas()
         df_pd["date"] = pd.to_datetime(df_pd["date"])
 
-        # Validate data before training
         print("Validating training data...")
         X_check = df_pd[self.feature_columns].values
         y_check = df_pd["regime_state_id"].values
@@ -422,7 +460,7 @@ class M002RegimeClassifier:
         print(f"Data validation passed: {X_check.shape[0]} samples, {X_check.shape[1]} features")
         print(f"Label distribution: {np.bincount(y_check.astype(int))}")
 
-        seq_array, label_array, meta_df, class_counts = self._build_sequences(
+        seq_array, label_array, _, class_counts = self._build_sequences(
             df_pd,
             seq_len=self.config.seq_len,
             feature_cols=self.feature_columns,
@@ -441,152 +479,146 @@ class M002RegimeClassifier:
         print(f"Sequence label distribution: {class_counts}")
 
         num_samples = seq_array.shape[0]
-        split_idx = max(int(num_samples * (1 - self.config.valid_ratio)), 1)
-        train_seq, valid_seq = seq_array[:split_idx], seq_array[split_idx:]
-        train_lbl, valid_lbl = label_array[:split_idx], label_array[split_idx:]
-
-        if valid_seq.shape[0] == 0:
-            valid_seq = train_seq.copy()
-            valid_lbl = train_lbl.copy()
-
-        train_dataset = RegimeSequenceDataset(train_seq, train_lbl)
-        valid_dataset = RegimeSequenceDataset(valid_seq, valid_lbl)
-
-        if self.config.balance_classes:
-            # Use balanced oversampling within each batch
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=self.config.batch_size,
-                shuffle=True,
-                drop_last=False,
-                collate_fn=lambda batch: balanced_collate_fn(batch, self.num_classes)
-            )
-        else:
-            train_loader = DataLoader(train_dataset, batch_size=self.config.batch_size, shuffle=True, drop_last=False)
-
-        valid_loader = DataLoader(valid_dataset, batch_size=self.config.batch_size, shuffle=False, drop_last=False)
-
-        # Compute class weights for validation (training uses balanced batches)
-        train_counts = np.bincount(train_lbl, minlength=self.num_classes)
-        class_weights = self._compute_class_weights(train_counts)
+        splits = self._build_walk_forward_splits(num_samples)
+        if not splits:
+            raise ValueError("Unable to create walk-forward splits for regime training.")
 
         device = self.config.device()
-        model = RegimeLSTM(
+        fold_metrics: List[Dict[str, float]] = []
+        best_overall_loss = math.inf
+        best_overall_state: Optional[Dict[str, Tensor]] = None
+        last_fold_state: Optional[Dict[str, Tensor]] = None
+
+        for fold_idx, (train_idx, valid_idx) in enumerate(splits):
+            train_seq, train_lbl = seq_array[train_idx], label_array[train_idx]
+            valid_seq, valid_lbl = seq_array[valid_idx], label_array[valid_idx]
+
+            if train_seq.size == 0 or valid_seq.size == 0:
+                print(f"Skipping fold {fold_idx}: insufficient samples (train={train_seq.shape[0]}, valid={valid_seq.shape[0]})")
+                continue
+
+            train_dataset = RegimeSequenceDataset(train_seq, train_lbl)
+            valid_dataset = RegimeSequenceDataset(valid_seq, valid_lbl)
+
+            if self.config.balance_classes:
+                train_loader = DataLoader(
+                    train_dataset,
+                    batch_size=self.config.batch_size,
+                    shuffle=True,
+                    drop_last=False,
+                    collate_fn=lambda batch: balanced_collate_fn(batch, self.num_classes),
+                )
+            else:
+                train_loader = DataLoader(train_dataset, batch_size=self.config.batch_size, shuffle=True, drop_last=False)
+
+            valid_loader = DataLoader(valid_dataset, batch_size=self.config.batch_size, shuffle=False, drop_last=False)
+
+            model = RegimeLSTM(
+                input_dim=len(self.feature_columns),
+                hidden_size=self.config.hidden_size,
+                num_layers=self.config.num_layers,
+                dropout=self.config.dropout,
+                num_classes=self.num_classes,
+            ).to(device)
+
+            criterion = nn.CrossEntropyLoss(
+                weight=None,
+                label_smoothing=self.config.label_smoothing,
+            )
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=self.config.learning_rate,
+                weight_decay=self.config.weight_decay,
+            )
+
+            fold_best_loss = math.inf
+            fold_best_state: Optional[Dict[str, Tensor]] = None
+
+            print(f"[Fold {fold_idx + 1}/{len(splits)}] train={train_seq.shape[0]}, valid={valid_seq.shape[0]} sequences")
+            for epoch in tqdm(range(self.config.max_epochs), desc=f"Fold {fold_idx + 1}", unit="epoch"):
+                model.train()
+                total_loss = 0.0
+                total_samples = 0
+
+                for X, y in train_loader:
+                    X = X.to(device)
+                    y = y.to(device)
+                    optimizer.zero_grad()
+                    logits = model(X)
+
+                    if torch.isnan(logits).any():
+                        print(f"Warning: NaN detected in logits at batch {X.size(0)}")
+                        continue
+
+                    loss = criterion(logits, y)
+                    if torch.isnan(loss):
+                        print("Warning: NaN loss detected, skipping batch")
+                        continue
+
+                    loss.backward()
+                    optimizer.step()
+
+                    total_loss += loss.item() * X.size(0)
+                    total_samples += X.size(0)
+
+                avg_train_loss = total_loss / max(total_samples, 1)
+
+                model.eval()
+                val_loss = 0.0
+                val_samples = 0
+                with torch.no_grad():
+                    for X, y in valid_loader:
+                        X = X.to(device)
+                        y = y.to(device)
+                        logits = model(X)
+                        loss = criterion(logits, y)
+                        val_loss += loss.item() * X.size(0)
+                        val_samples += X.size(0)
+
+                avg_val_loss = val_loss / max(val_samples, 1)
+                if avg_val_loss < fold_best_loss:
+                    fold_best_loss = avg_val_loss
+                    fold_best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+                print(f"    Epoch {epoch + 1}: train_loss={avg_train_loss:.4f}, val_loss={avg_val_loss:.4f}")
+
+            if fold_best_state is None:
+                fold_best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+            fold_metrics.append(
+                {
+                    "fold": fold_idx,
+                    "train_size": int(train_seq.shape[0]),
+                    "valid_size": int(valid_seq.shape[0]),
+                    "best_valid_loss": float(fold_best_loss),
+                }
+            )
+
+            if fold_best_loss < best_overall_loss:
+                best_overall_loss = fold_best_loss
+                best_overall_state = fold_best_state
+
+            last_fold_state = fold_best_state
+
+        final_state = last_fold_state or best_overall_state
+        if final_state is None:
+            raise RuntimeError("Regime classifier training did not produce a valid state.")
+
+        self.model = RegimeLSTM(
             input_dim=len(self.feature_columns),
             hidden_size=self.config.hidden_size,
             num_layers=self.config.num_layers,
             dropout=self.config.dropout,
             num_classes=self.num_classes,
-        ).to(device)
-        # When using balanced oversampling, don't use class weights since batches are already balanced
-        criterion = nn.CrossEntropyLoss(
-            weight=None,  # Balanced batches don't need class weights
-            label_smoothing=self.config.label_smoothing,
         )
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay,
-        )
+        self.model.load_state_dict(final_state)
+        self.model.to(device)
+        self.model.eval()
 
-        best_val_loss = math.inf
-        best_state: Optional[Dict[str, Tensor]] = None
-
-        print(f"Training regime classifier for {self.config.max_epochs} epochs...")
-        for epoch in tqdm(range(self.config.max_epochs), desc="Epochs", unit="epoch"):
-            model.train()
-            total_loss = 0.0
-            total_samples = 0
-
-            # Training loop with progress bar
-            train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.config.max_epochs} [Train]",
-                             leave=False, unit="batch")
-            for X, y in train_pbar:
-                X = X.to(device)
-                y = y.to(device)
-                optimizer.zero_grad()
-                logits = model(X)
-
-                # Check for NaN in logits
-                if torch.isnan(logits).any():
-                    print(f"Warning: NaN detected in logits at batch {X.size(0)}")
-                    print(f"Logits sample: {logits[0]}")
-                    continue
-
-                loss = criterion(logits, y)
-
-                # Check for NaN in loss
-                if torch.isnan(loss):
-                    print(f"Warning: NaN loss detected at batch, skipping...")
-                    continue
-
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item() * X.size(0)
-                total_samples += X.size(0)
-
-                # Update progress bar with current loss
-                train_pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-
-            train_loss = total_loss / max(total_samples, 1)
-
-            model.eval()
-            valid_loss = 0.0
-            correct = 0
-            count = 0
-
-            # Validation loop with progress bar
-            valid_pbar = tqdm(valid_loader, desc=f"Epoch {epoch+1}/{self.config.max_epochs} [Valid]",
-                             leave=False, unit="batch")
-            with torch.no_grad():
-                for X, y in valid_pbar:
-                    X = X.to(device)
-                    y = y.to(device)
-                    logits = model(X)
-
-                    # Check for NaN in validation logits
-                    if torch.isnan(logits).any():
-                        print(f"Warning: NaN detected in validation logits")
-                        continue
-
-                    loss = criterion(logits, y)
-
-                    # Check for NaN in validation loss
-                    if torch.isnan(loss):
-                        print(f"Warning: NaN validation loss detected")
-                        continue
-
-                    valid_loss += loss.item() * X.size(0)
-                    preds = logits.argmax(dim=1)
-                    correct += (preds == y).sum().item()
-                    count += X.size(0)
-
-                    # Update progress bar with current loss
-                    valid_pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-
-            valid_loss /= max(count, 1)
-            valid_acc = correct / max(count, 1)
-
-            # Update epoch progress bar with final metrics
-            tqdm.write(f"Epoch {epoch+1}/{self.config.max_epochs} - "
-                      f"Train Loss: {train_loss:.4f}, Valid Loss: {valid_loss:.4f}, "
-                      f"Valid Acc: {valid_acc:.4f}")
-
-            if valid_loss < best_val_loss:
-                best_val_loss = valid_loss
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-
-        if best_state is not None:
-            model.load_state_dict(best_state)
-
-        self.model = model
         metrics = {
-            "train_loss": float(train_loss),
-            "valid_loss": float(best_val_loss),
-            "valid_accuracy": float(valid_acc),
-            "n_sequences": int(num_samples),
+            "num_sequences": int(num_samples),
             "class_counts": class_counts.tolist(),
-            "class_weights": class_weights.cpu().numpy().tolist(),
+            "fold_metrics": fold_metrics,
         }
         return metrics
 

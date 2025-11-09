@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -73,6 +73,10 @@ class M002TrainingConfig:
     valid_size: float = 0.2
     random_state: int = 42
     risk_aversion: float = 0.5  # λ in policy score
+    use_walk_forward: bool = True
+    walk_forward_train_ratio: float = 0.7
+    walk_forward_valid_ratio: float = 0.1
+    walk_forward_step_ratio: float = 0.1
 
 
 class M002MultiTaskModel:
@@ -179,6 +183,71 @@ class M002MultiTaskModel:
         df_pd = df_pl.select(output_cols).to_pandas()
         return df_pd
 
+    def _make_head_fold(
+        self,
+        train_df: pd.DataFrame,
+        valid_df: pd.DataFrame,
+        feature_cols: Sequence[str],
+        ret_col: str,
+        dd_col: str,
+    ) -> Dict[str, pd.DataFrame]:
+        return {
+            "X_train": train_df[feature_cols].reset_index(drop=True),
+            "X_valid": valid_df[feature_cols].reset_index(drop=True),
+            "y_cls_train": train_df["label_rebound_bin"].astype(int).reset_index(drop=True),
+            "y_cls_valid": valid_df["label_rebound_bin"].astype(int).reset_index(drop=True),
+            "y_reg_train": train_df[[ret_col, dd_col]].reset_index(drop=True),
+            "y_reg_valid": valid_df[[ret_col, dd_col]].reset_index(drop=True),
+        }
+
+    def _build_single_split_fold(
+        self,
+        df_pd: pd.DataFrame,
+        feature_cols: Sequence[str],
+        ret_col: str,
+        dd_col: str,
+    ) -> List[Dict[str, pd.DataFrame]]:
+        train_df, valid_df = train_test_split(
+            df_pd,
+            test_size=self.config.valid_size,
+            shuffle=False,
+        )
+        return [self._make_head_fold(train_df, valid_df, feature_cols, ret_col, dd_col)]
+
+    def _build_head_walk_forward_folds(
+        self,
+        df_pd: pd.DataFrame,
+        feature_cols: Sequence[str],
+        ret_col: str,
+        dd_col: str,
+    ) -> List[Dict[str, pd.DataFrame]]:
+        if df_pd.empty:
+            return []
+
+        if not self.config.use_walk_forward:
+            return self._build_single_split_fold(df_pd, feature_cols, ret_col, dd_col)
+
+        n = len(df_pd)
+        train_size = max(int(n * self.config.walk_forward_train_ratio), 1)
+        valid_size = max(int(n * self.config.walk_forward_valid_ratio), 1)
+        step = max(int(n * self.config.walk_forward_step_ratio), 1)
+        step = max(step, valid_size)
+
+        if train_size + valid_size > n:
+            return self._build_single_split_fold(df_pd, feature_cols, ret_col, dd_col)
+
+        folds: List[Dict[str, pd.DataFrame]] = []
+        start = 0
+        while start + train_size + valid_size <= n:
+            train_slice = df_pd.iloc[start : start + train_size]
+            valid_slice = df_pd.iloc[start + train_size : start + train_size + valid_size]
+            folds.append(self._make_head_fold(train_slice, valid_slice, feature_cols, ret_col, dd_col))
+            start += step
+
+        if not folds:
+            return self._build_single_split_fold(df_pd, feature_cols, ret_col, dd_col)
+        return folds
+
     def train(self, data: Optional[pd.DataFrame] = None) -> Dict[str, float]:
         ret_col = f"ret_{self.config.horizon}d_pct"
         dd_col = f"dd_{self.config.horizon}d_pct"
@@ -193,67 +262,78 @@ class M002MultiTaskModel:
                 raise ValueError(f"Provided data is missing required columns: features={missing}, targets={missing_targets}")
             data = data.copy()
 
-        train_df, valid_df = train_test_split(
-            data,
-            test_size=self.config.valid_size,
-            shuffle=False,
-        )
+        data = data.sort_values(["date", "ticker"]).reset_index(drop=True)
+        folds = self._build_head_walk_forward_folds(data, self.feature_columns, ret_col, dd_col)
+        if not folds:
+            raise ValueError("No walk-forward folds could be generated for training.")
 
-        X_train = train_df[list(self.feature_columns)]
-        X_valid = valid_df[list(self.feature_columns)]
+        fold_metrics: List[Dict[str, float]] = []
+        latest_classifier: Optional[lgb.LGBMClassifier] = None
+        latest_regressor: Optional[MultiOutputRegressor] = None
 
-        y_train_cls = train_df["label_rebound_bin"]
-        y_valid_cls = valid_df["label_rebound_bin"]
+        for fold_idx, fold in enumerate(folds):
+            X_train = fold["X_train"]
+            X_valid = fold["X_valid"]
+            y_train_cls = fold["y_cls_train"]
+            y_valid_cls = fold["y_cls_valid"]
+            y_train_reg = fold["y_reg_train"]
+            y_valid_reg = fold["y_reg_valid"]
 
-        y_train_reg = train_df[[ret_col, dd_col]]
-        y_valid_reg = valid_df[[ret_col, dd_col]]
+            nan_mask_train = y_train_reg.isna().any(axis=1)
+            if nan_mask_train.any():
+                X_train = X_train[~nan_mask_train]
+                y_train_cls = y_train_cls[~nan_mask_train]
+                y_train_reg = y_train_reg[~nan_mask_train]
 
-        # NaN 값 제거 (안전장치)
-        nan_mask_train = y_train_reg.isna().any(axis=1)
-        nan_mask_valid = y_valid_reg.isna().any(axis=1)
+            nan_mask_valid = y_valid_reg.isna().any(axis=1)
+            if nan_mask_valid.any():
+                X_valid = X_valid[~nan_mask_valid]
+                y_valid_cls = y_valid_cls[~nan_mask_valid]
+                y_valid_reg = y_valid_reg[~nan_mask_valid]
 
-        if nan_mask_train.any():
-            print(f"경고: 훈련 데이터에서 {nan_mask_train.sum()}개의 NaN 행 제거")
-            X_train = X_train[~nan_mask_train]
-            y_train_cls = y_train_cls[~nan_mask_train]
-            y_train_reg = y_train_reg[~nan_mask_train]
+            classifier = lgb.LGBMClassifier(**self.classifier_params)
+            classifier.fit(X_train, y_train_cls)
 
-        if nan_mask_valid.any():
-            print(f"경고: 검증 데이터에서 {nan_mask_valid.sum()}개의 NaN 행 제거")
-            X_valid = X_valid[~nan_mask_valid]
-            y_valid_cls = y_valid_cls[~nan_mask_valid]
-            y_valid_reg = y_valid_reg[~nan_mask_valid]
+            reg_base = lgb.LGBMRegressor(**self.regressor_params)
+            reg_multi = MultiOutputRegressor(reg_base)
+            reg_multi.fit(X_train, y_train_reg)
 
-        self.classifier = lgb.LGBMClassifier(**self.classifier_params)
-        self.classifier.fit(X_train, y_train_cls)
+            cls_pred_prob = classifier.predict_proba(X_valid)[:, 1]
+            reg_pred = reg_multi.predict(X_valid)
+            ret_pred = reg_pred[:, 0]
+            dd_pred = reg_pred[:, 1]
+            policy_score = cls_pred_prob * (ret_pred / 100.0) - self.config.risk_aversion * np.maximum(0.0, -(dd_pred / 100.0))
 
-        reg_base = lgb.LGBMRegressor(**self.regressor_params)
-        self.regressor = MultiOutputRegressor(reg_base)
-        self.regressor.fit(X_train, y_train_reg)
+            fold_metric = {
+                "fold": fold_idx,
+                "valid_avg_precision": float(average_precision_score(y_valid_cls, cls_pred_prob)),
+                "valid_mae_ret": float(mean_absolute_error(y_valid_reg.iloc[:, 0], ret_pred)),
+                "valid_mae_dd": float(mean_absolute_error(y_valid_reg.iloc[:, 1], dd_pred)),
+                "valid_policy_score_mean": float(np.nanmean(policy_score)),
+                "classification_report": classification_report(
+                    y_valid_cls,
+                    (cls_pred_prob >= 0.5).astype(int),
+                    target_names=["NoRebound", "Rebound"],
+                    zero_division=0,
+                    output_dict=False,
+                ),
+            }
+            fold_metrics.append(fold_metric)
 
-        cls_pred_prob = self.classifier.predict_proba(X_valid)[:, 1]
-        reg_pred = self.regressor.predict(X_valid)
-        ret_pred = reg_pred[:, 0]
-        dd_pred = reg_pred[:, 1]
+            if fold_idx == len(folds) - 1:
+                latest_classifier = classifier
+                latest_regressor = reg_multi
 
-        policy_score = cls_pred_prob * (ret_pred / 100.0) - self.config.risk_aversion * np.maximum(0.0, -(dd_pred / 100.0))
+        if latest_classifier is None or latest_regressor is None:
+            raise RuntimeError("Walk-forward training did not produce final models.")
 
-        metrics = {
-            "valid_avg_precision": average_precision_score(y_valid_cls, cls_pred_prob),
-            "valid_mae_ret": mean_absolute_error(y_valid_reg.iloc[:, 0], ret_pred),
-            "valid_mae_dd": mean_absolute_error(y_valid_reg.iloc[:, 1], dd_pred),
-            "valid_policy_score_mean": float(np.nanmean(policy_score)),
-        }
+        self.classifier = latest_classifier
+        self.regressor = latest_regressor
 
-        metrics["classification_report"] = classification_report(
-            y_valid_cls,
-            (cls_pred_prob >= 0.5).astype(int),
-            target_names=["NoRebound", "Rebound"],
-            zero_division=0,
-            output_dict=False,
-        )
-
-        return metrics
+        summary = dict(fold_metrics[-1])
+        summary["fold_metrics"] = fold_metrics
+        summary["n_rows"] = int(len(data))
+        return summary
 
     def predict(self, features: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self.classifier is None or self.regressor is None:

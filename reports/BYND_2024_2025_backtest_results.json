@@ -1,0 +1,29 @@
+{
+  "metadata": {
+    "ticker": "BYND",
+    "start_date": "2024-10-23",
+    "end_date": "2025-10-23",
+    "model_path": "models/saved/m002_full_architecture_US_2000-2018.pkl",
+    "generated_at": "2025-10-23T12:27:40.363261",
+    "model_name": "M002_Full_Architecture"
+  },
+  "performance_metrics": {
+    "initial_price": 6.190000057220459,
+    "final_price": 3.5799999237060547,
+    "total_return_pct": -42.164783673465614,
+    "data_points": 250,
+    "start_date": "2024-10-23",
+    "end_date": "2025-10-22",
+    "long_signals": 21,
+    "short_signals": 20,
+    "flat_signals": 150,
+    "return_pct": -12.195568754585985,
+    "buy_and_hold_return_pct": -42.164783673465614,
+    "sharpe_ratio": -0.36340587621946085,
+    "max_drawdown_pct": -27.239248859684473,
+    "win_rate_pct": 54.54545454545454,
+    "total_trades": 11,
+    "equity_final": 8780.443124541402,
+    "equity_peak": 11690.441944993496
+  }
+}

@@ -215,6 +215,66 @@ class M002FullArchitecture:
 
     # ---------- Training ----------
 
+    def _make_head_fold(
+        self,
+        df_pd: pd.DataFrame,
+        train_slice: slice,
+        valid_slice: slice,
+        feature_cols: Sequence[str],
+        ret_col: str,
+        dd_col: str,
+    ) -> Dict[str, pd.DataFrame]:
+        train_df = df_pd.iloc[train_slice].reset_index(drop=True)
+        valid_df = df_pd.iloc[valid_slice].reset_index(drop=True)
+        return {
+            "X_train": train_df[list(feature_cols)],
+            "X_valid": valid_df[list(feature_cols)],
+            "y_cls_train": train_df["label_rebound_bin"].astype(int),
+            "y_cls_valid": valid_df["label_rebound_bin"].astype(int),
+            "y_reg_train": train_df[[ret_col, dd_col]],
+            "y_reg_valid": valid_df[[ret_col, dd_col]],
+        }
+
+    def _build_head_folds(
+        self,
+        df_pd: pd.DataFrame,
+        feature_cols: Sequence[str],
+        ret_col: str,
+        dd_col: str,
+    ) -> List[Dict[str, pd.DataFrame]]:
+        cfg = self.config.multitask
+        n = len(df_pd)
+        if n == 0:
+            return []
+
+        if not getattr(cfg, "use_walk_forward", False):
+            split_idx = max(int(n * (1 - cfg.valid_size)), 1)
+            train_slice = slice(0, split_idx)
+            valid_slice = slice(split_idx, n)
+            return [self._make_head_fold(df_pd, train_slice, valid_slice, feature_cols, ret_col, dd_col)]
+
+        train_size = max(int(n * cfg.walk_forward_train_ratio), 1)
+        valid_size = max(int(n * cfg.walk_forward_valid_ratio), 1)
+        step = max(int(n * cfg.walk_forward_step_ratio), 1)
+        step = max(step, valid_size)
+
+        if train_size + valid_size > n:
+            split_idx = max(int(n * (1 - cfg.valid_size)), 1)
+            return [self._make_head_fold(df_pd, slice(0, split_idx), slice(split_idx, n), feature_cols, ret_col, dd_col)]
+
+        folds: List[Dict[str, pd.DataFrame]] = []
+        start = 0
+        while start + train_size + valid_size <= n:
+            train_slice = slice(start, start + train_size)
+            valid_slice = slice(start + train_size, start + train_size + valid_size)
+            folds.append(self._make_head_fold(df_pd, train_slice, valid_slice, feature_cols, ret_col, dd_col))
+            start += step
+
+        if not folds:
+            split_idx = max(int(n * (1 - cfg.valid_size)), 1)
+            folds.append(self._make_head_fold(df_pd, slice(0, split_idx), slice(split_idx, n), feature_cols, ret_col, dd_col))
+        return folds
+
     def _prepare_head_dataset(self) -> Dict[str, pd.DataFrame]:
         df = self._load_base_dataframe()
         state_probs = self.regime.predict_probabilities(
@@ -239,30 +299,16 @@ class M002FullArchitecture:
 
         targets = df_pd[[ret_col, dd_col]]
         mask = targets.notna().all(axis=1)
-        df_pd = df_pd.loc[mask].reset_index(drop=True)
+        df_pd = df_pd.loc[mask].sort_values(["date", "ticker"]).reset_index(drop=True)
         if df_pd.empty:
             raise ValueError("No valid samples after removing NaN targets.")
 
-        X = df_pd[available_head_features]
-        y_cls = df_pd["label_rebound_bin"].astype(int)
-        y_reg = df_pd[[ret_col, dd_col]]
-
-        n = len(X)
-        split_idx = max(int(n * 0.8), 1)
-        X_train, X_valid = X.iloc[:split_idx], X.iloc[split_idx:]
-        y_cls_train, y_cls_valid = y_cls.iloc[:split_idx], y_cls.iloc[split_idx:]
-        y_reg_train, y_reg_valid = y_reg.iloc[:split_idx], y_reg.iloc[split_idx:]
-
-        if X_valid.empty:
-            X_valid, y_cls_valid, y_reg_valid = X_train.copy(), y_cls_train.copy(), y_reg_train.copy()
+        folds = self._build_head_folds(df_pd, available_head_features, ret_col, dd_col)
+        if not folds:
+            raise ValueError("Failed to generate walk-forward folds for head dataset.")
 
         return {
-            "X_train": X_train,
-            "X_valid": X_valid,
-            "y_cls_train": y_cls_train,
-            "y_cls_valid": y_cls_valid,
-            "y_reg_train": y_reg_train,
-            "y_reg_valid": y_reg_valid,
+            "folds": folds,
             "available_head_features": tuple(available_head_features),
         }
 
@@ -297,17 +343,16 @@ class M002FullArchitecture:
 
     def _fit_head_models(
         self,
-        data: Dict[str, pd.DataFrame],
+        fold: Dict[str, pd.DataFrame],
         clf_params: Dict,
         reg_params: Dict,
-        store_model: bool = True,
-    ) -> Dict[str, float]:
-        X_train = data["X_train"]
-        X_valid = data["X_valid"]
-        y_cls_train = data["y_cls_train"]
-        y_cls_valid = data["y_cls_valid"]
-        y_reg_train = data["y_reg_train"]
-        y_reg_valid = data["y_reg_valid"]
+    ) -> Tuple[Dict[str, float], lgb.LGBMClassifier, MultiOutputRegressor]:
+        X_train = fold["X_train"]
+        X_valid = fold["X_valid"]
+        y_cls_train = fold["y_cls_train"]
+        y_cls_valid = fold["y_cls_valid"]
+        y_reg_train = fold["y_reg_train"]
+        y_reg_valid = fold["y_reg_valid"]
 
         head_model = lgb.LGBMClassifier(**clf_params)
         head_model.fit(
@@ -321,12 +366,6 @@ class M002FullArchitecture:
         head_multi = MultiOutputRegressor(base_reg)
         head_multi.fit(X_train, y_reg_train)
 
-        if store_model:
-            self.head_model = head_model
-            self.head_multi = head_multi
-
-        from sklearn.metrics import average_precision_score, mean_absolute_error
-
         prob_valid = head_model.predict_proba(X_valid)[:, 1]
         reg_valid = head_multi.predict(X_valid)
         ret_pred_valid, dd_pred_valid = reg_valid[:, 0], reg_valid[:, 1]
@@ -334,13 +373,15 @@ class M002FullArchitecture:
             prob_valid, ret_pred_valid, dd_pred_valid, self.policy_cfg.risk_aversion
         )
 
+        from sklearn.metrics import average_precision_score, mean_absolute_error
+
         head_metrics = {
             "valid_avg_precision": float(average_precision_score(y_cls_valid, prob_valid)),
             "valid_mae_ret": float(mean_absolute_error(y_reg_valid.iloc[:, 0], ret_pred_valid)),
             "valid_mae_dd": float(mean_absolute_error(y_reg_valid.iloc[:, 1], dd_pred_valid)),
             "valid_policy_mean": float(np.nanmean(policy_scores)),
         }
-        return head_metrics
+        return head_metrics, head_model, head_multi
 
     def tune_head_hyperparams(
         self,
@@ -357,6 +398,9 @@ class M002FullArchitecture:
             ) from exc
 
         data = self._prepare_head_dataset()
+        folds = data["folds"]
+        if not folds:
+            raise ValueError("No walk-forward folds available for head tuning.")
         self.head_features = data["available_head_features"]
         defaults = self._default_head_params()
 
@@ -396,7 +440,7 @@ class M002FullArchitecture:
                 min_child_samples=trial.suggest_int("reg_min_child_samples", 10, 80),
             )
 
-            metrics = self._fit_head_models(data, clf_params, reg_params, store_model=False)
+            metrics, _, _ = self._fit_head_models(folds[-1], clf_params, reg_params)
             score = metrics["valid_avg_precision"] + 0.1 * metrics["valid_policy_mean"]
             trial.set_user_attr("metrics", metrics)
             return score
@@ -434,15 +478,39 @@ class M002FullArchitecture:
         if self.config.verbose:
             print("[B] Preparing head dataset ...")
         data = self._prepare_head_dataset()
+        folds = data["folds"]
+        if not folds:
+            raise ValueError("Head dataset preparation produced no folds.")
         self.head_features = data["available_head_features"]
 
         # Always use default parameters (skip Optuna tuning)
         params = self._default_head_params()
 
-        head_metrics = self._fit_head_models(data, params["clf"], params["reg"])
+        fold_metrics: List[Dict[str, float]] = []
+        latest_head_model: Optional[lgb.LGBMClassifier] = None
+        latest_head_multi: Optional[MultiOutputRegressor] = None
 
-        self.head_features = data["available_head_features"]
-        self.trained_state = {"regime_metrics": regime_metrics, "head_metrics": head_metrics, "head_params": params}
+        for fold_idx, fold in enumerate(folds):
+            metrics, head_model, head_multi = self._fit_head_models(fold, params["clf"], params["reg"])
+            metrics_with_fold = dict(metrics)
+            metrics_with_fold["fold"] = fold_idx
+            fold_metrics.append(metrics_with_fold)
+
+            if fold_idx == len(folds) - 1:
+                latest_head_model = head_model
+                latest_head_multi = head_multi
+
+        if latest_head_model is None or latest_head_multi is None:
+            raise RuntimeError("Failed to train head models on walk-forward folds.")
+
+        self.head_model = latest_head_model
+        self.head_multi = latest_head_multi
+
+        self.trained_state = {
+            "regime_metrics": regime_metrics,
+            "head_metrics": fold_metrics,
+            "head_params": params,
+        }
         return self.trained_state
 
     # ---------- Policy ----------
