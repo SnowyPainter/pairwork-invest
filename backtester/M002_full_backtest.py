@@ -62,6 +62,12 @@ class M002FullStrategy(Strategy):
         # 인디케이터 등록은 필요 없고 next에서 직접 참조
         self.min_hold_bars = max(int(getattr(self, "min_hold_bars", 0)), 0)
         self._bars_since_rebalance = self.min_hold_bars  # allow immediate first trade
+        self.drawdown_soft_limit = max(float(getattr(self, "drawdown_soft_limit", 0.05)), 0.0)
+        self.drawdown_hard_limit = max(
+            float(getattr(self, "drawdown_hard_limit", 0.20)),
+            self.drawdown_soft_limit + 1e-6,
+        )
+        self._equity_peak = float(self.equity)
 
     def next(self):
         i = len(self.data.Close) - 1
@@ -85,6 +91,21 @@ class M002FullStrategy(Strategy):
         equity = float(self.equity)
         if not math.isfinite(equity) or equity <= 0:
             return
+
+        # Drawdown-based risk control
+        self._equity_peak = max(self._equity_peak, equity)
+        dd_ratio = 0.0
+        if self._equity_peak > 0:
+            dd_ratio = 1.0 - (equity / self._equity_peak)
+            dd_ratio = max(dd_ratio, 0.0)
+
+        if dd_ratio >= self.drawdown_hard_limit:
+            target_frac = 0.0
+        elif dd_ratio > self.drawdown_soft_limit:
+            scale = 1.0 - (dd_ratio - self.drawdown_soft_limit) / (
+                self.drawdown_hard_limit - self.drawdown_soft_limit
+            )
+            target_frac *= max(0.0, min(scale, 1.0))
 
         if target_frac > 0:
             desired_units = max(1.0, target_frac * equity / price)
@@ -136,6 +157,8 @@ class M002FullBacktester:
         min_hold_bars: int = 3,
         robust_min_trades: int = 30,
         robust_min_dd_pct: float = 1.0,
+        drawdown_soft_limit: float = 0.05,
+        drawdown_hard_limit: float = 0.20,
     ):
         self.model = model
         self.commission = commission
@@ -145,6 +168,8 @@ class M002FullBacktester:
         self.min_hold_bars = max(int(min_hold_bars), 0)
         self.robust_min_trades = max(int(robust_min_trades), 0)
         self.robust_min_dd_pct = max(float(robust_min_dd_pct), 0.0)
+        self.drawdown_soft_limit = max(float(drawdown_soft_limit), 0.0)
+        self.drawdown_hard_limit = max(float(drawdown_hard_limit), self.drawdown_soft_limit + 1e-6)
 
     # ---------- 데이터 준비 ----------
     def prepare_data(
@@ -348,7 +373,11 @@ class M002FullBacktester:
         strategy_cls = type(
             "ConfiguredM002FullStrategy",
             (M002FullStrategy,),
-            {"min_hold_bars": self.min_hold_bars},
+            {
+                "min_hold_bars": self.min_hold_bars,
+                "drawdown_soft_limit": self.drawdown_soft_limit,
+                "drawdown_hard_limit": self.drawdown_hard_limit,
+            },
         )
 
         bt = Backtest(
@@ -540,6 +569,8 @@ def main():
         n_jobs=64,
         chart_tickers=chart_tickers,
         min_hold_bars=0,
+        drawdown_soft_limit=0.05,
+        drawdown_hard_limit=0.20,
     )
 
     stats_df = backtester.run(

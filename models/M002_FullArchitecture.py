@@ -117,9 +117,9 @@ def _soft_policy_score(prob: np.ndarray, ret_pct: np.ndarray, dd_pct: np.ndarray
 # ---------------------------
 @dataclass
 class PolicyConfig:
-    target_flat_ratio: float = 0.10
-    target_short_ratio: float = 0.35
-    score_scale: float = 3.5
+    target_flat_ratio: float = 0.15
+    target_short_ratio: float = 0.30
+    score_scale: float = 3.0
     rescale_window: int = 60
     ex_ante_vol_window: int = 5
     size_k: float = 1.2
