@@ -129,7 +129,10 @@ class PolicyConfig:
     risk_aversion: float = 0.5
     ex_ante_vol_floor: float = 0.15
     ex_ante_vol_abs: bool = True
-    version: int = 2
+    min_expected_return_pct: float = 0.1
+    max_peak_prob_for_long: float = 0.7
+    min_effective_score_for_trade: float = 0.1
+    version: int = 3
 
 
 
@@ -619,6 +622,7 @@ class M002FullArchitecture:
         def decide(row: pd.Series) -> str:
             score = float(row["effective_score"])
             peak_prob = float(row.get("state_prob_Peak", 0.0))
+            expected_ret = float(row.get("pred_expected_ret_pct", 0.0))
 
             # 이벤트 기반 가중치
             if int(row.get("I_vr_and_vs", 0)) == 1:
@@ -628,9 +632,16 @@ class M002FullArchitecture:
             if int(row.get("I_bd_early", 0)) == 1:
                 score *= 1.1
 
+            if abs(score) < cfg.min_effective_score_for_trade:
+                return "FLAT"
+            if expected_ret < cfg.min_expected_return_pct:
+                return "FLAT"
+
             # adaptive threshold에 따라 결정
             if score >= long_q:
-                return "LONG"
+                if peak_prob <= cfg.max_peak_prob_for_long:
+                    return "LONG"
+                return "FLAT"
             elif score <= short_q or (peak_prob >= cfg.restrict_short_on_peak_prob and score < flat_low):
                 return "SHORT"
             elif flat_low < score < flat_high:
