@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import os
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Sequence, Tuple, List
+from typing import Dict, Optional, Sequence, Tuple, List, Any
 
 import numpy as np
 import pandas as pd
@@ -116,8 +117,8 @@ def _soft_policy_score(prob: np.ndarray, ret_pct: np.ndarray, dd_pct: np.ndarray
 # ---------------------------
 @dataclass
 class PolicyConfig:
-    target_flat_ratio: float = 0.45
-    target_short_ratio: float = 0.1
+    target_flat_ratio: float = 0.40
+    target_short_ratio: float = 0.15
     score_scale: float = 2.5
     rescale_window: int = 60
     ex_ante_vol_window: int = 5
@@ -126,6 +127,9 @@ class PolicyConfig:
     restrict_short_on_peak_prob: float = 0.35
     use_rescaled_score: bool = True
     risk_aversion: float = 0.5
+    ex_ante_vol_floor: float = 0.15
+    ex_ante_vol_abs: bool = True
+    version: int = 2
 
 
 
@@ -168,12 +172,28 @@ class M002FullArchitecture:
         self.policy_cfg = self.config.policy
         if getattr(self.policy_cfg, "risk_aversion", None) is None:
             self.policy_cfg.risk_aversion = getattr(self.config.multitask, "risk_aversion", 0.5)
+        self._ensure_policy_defaults()
 
         self.head_model: Optional[lgb.LGBMClassifier] = None
         self.head_multi: Optional[MultiOutputRegressor] = None
         self.head_features: Sequence[str] = HEAD_FEATURES
 
         self.trained_state: Dict[str, Dict] = {}
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._ensure_policy_defaults()
+
+    def _ensure_policy_defaults(self, force: bool = False) -> None:
+        latest = PolicyConfig()
+        current_version = getattr(getattr(self, "policy_cfg", None), "version", 0)
+        env_force = os.environ.get("M002_POLICY_FORCE_RESET")
+        if env_force:
+            force = True
+        if current_version < latest.version or force:
+            self.policy_cfg = deepcopy(latest)
+            if hasattr(self, "config"):
+                self.config.policy = self.policy_cfg
 
     # ---------- Data ----------
 
@@ -515,20 +535,44 @@ class M002FullArchitecture:
 
     # ---------- Policy ----------
 
-    def _apply_policy(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _apply_policy(
+        self,
+        df: pd.DataFrame,
+        policy_cfg: Optional[PolicyConfig] = None,
+    ) -> pd.DataFrame:
         """Adaptive threshold policy application (balanced signal distribution)."""
+        cfg = policy_cfg or self.policy_cfg
         out = df.copy()
+        debug = bool(os.environ.get("M002_POLICY_DEBUG")) or getattr(self.config, "verbose", False)
+
+        def _dbg(msg: str) -> None:
+            if debug:
+                print(f"[Policy] {msg}")
 
         # === 1️⃣ ex-ante volatility 계산 ===
-        out["ex_ante_vol"] = (
+        ex_vol = (
             out.groupby("ticker")["atr_smooth"]
-            .transform(lambda s: s.rolling(self.policy_cfg.ex_ante_vol_window, min_periods=1).mean())
-            .replace(0.0, np.nan)
+            .transform(lambda s: s.rolling(cfg.ex_ante_vol_window, min_periods=1).mean())
         )
+        if cfg.ex_ante_vol_abs:
+            ex_vol = ex_vol.abs()
+        ex_vol = ex_vol.replace([np.inf, -np.inf], np.nan)
+        ex_vol = ex_vol.replace(0.0, np.nan)
+        if cfg.ex_ante_vol_floor is not None:
+            ex_vol = ex_vol.fillna(cfg.ex_ante_vol_floor)
+            ex_vol = ex_vol.clip(lower=cfg.ex_ante_vol_floor)
+        else:
+            ex_vol = ex_vol.fillna(1.0)
+        out["ex_ante_vol"] = ex_vol
+        if debug:
+            vol = out["ex_ante_vol"].replace([np.inf, -np.inf], np.nan)
+            _dbg(
+                f"ex_ante_vol mean={vol.mean():.4f}, std={vol.std():.4f}, pct_nan={vol.isna().mean():.2%}"
+            )
 
         # === 2️⃣ score rescaling ===
-        if self.policy_cfg.use_rescaled_score:
-            window = max(self.policy_cfg.rescale_window, 20)
+        if cfg.use_rescaled_score:
+            window = max(cfg.rescale_window, 20)
 
             def _rolling_z(series: pd.Series) -> pd.Series:
                 roll = series.rolling(window, min_periods=max(window // 3, 5))
@@ -537,20 +581,39 @@ class M002FullArchitecture:
                 return ((series - mean) / std).fillna(0.0)
 
             out["policy_score_rescaled"] = (
-                out.groupby("ticker")["policy_score"].transform(_rolling_z) * self.policy_cfg.score_scale
+                out.groupby("ticker")["policy_score"].transform(_rolling_z) * cfg.score_scale
             )
             effective_score = out["policy_score_rescaled"]
         else:
             effective_score = out["policy_score"]
 
         out["effective_score"] = effective_score
+        if debug:
+            eff = effective_score.replace([np.inf, -np.inf], np.nan)
+            _dbg(
+                f"effective_score mean={eff.mean():.4f}, std={eff.std():.4f}, min={eff.min():.4f}, max={eff.max():.4f}"
+            )
 
         # === 3️⃣ adaptive threshold 설정 ===
         valid_scores = out["effective_score"].replace([np.inf, -np.inf], np.nan).dropna()
-        long_q = np.quantile(valid_scores, 1 - self.policy_cfg.target_short_ratio)
-        short_q = np.quantile(valid_scores, self.policy_cfg.target_short_ratio)
-        flat_low = np.quantile(valid_scores, 0.5 - self.policy_cfg.target_flat_ratio / 2)
-        flat_high = np.quantile(valid_scores, 0.5 + self.policy_cfg.target_flat_ratio / 2)
+        target_long_ratio = max(0.0, 1.0 - cfg.target_short_ratio - cfg.target_flat_ratio)
+        target_long_ratio = min(target_long_ratio, 1.0)
+        if len(valid_scores) == 0:
+            long_q = short_q = flat_low = flat_high = 0.0
+        else:
+            long_p = max(0.0, min(1.0, 1.0 - target_long_ratio))
+            short_p = max(0.0, min(1.0, cfg.target_short_ratio))
+            flat_lo_p = max(0.0, min(1.0, 0.5 - cfg.target_flat_ratio / 2))
+            flat_hi_p = max(0.0, min(1.0, 0.5 + cfg.target_flat_ratio / 2))
+            long_q = float(np.quantile(valid_scores, long_p))
+            short_q = float(np.quantile(valid_scores, short_p))
+            flat_low = float(np.quantile(valid_scores, flat_lo_p))
+            flat_high = float(np.quantile(valid_scores, flat_hi_p))
+        _dbg(
+            f"quantiles long_q={long_q:.4f} (p={1.0 - target_long_ratio:.2f}), "
+            f"short_q={short_q:.4f} (p={cfg.target_short_ratio:.2f}), "
+            f"flat=({flat_low:.4f},{flat_high:.4f})"
+        )
 
         # === 4️⃣ decision logic ===
         def decide(row: pd.Series) -> str:
@@ -568,7 +631,7 @@ class M002FullArchitecture:
             # adaptive threshold에 따라 결정
             if score >= long_q:
                 return "LONG"
-            elif score <= short_q or (peak_prob >= self.policy_cfg.restrict_short_on_peak_prob and score < flat_low):
+            elif score <= short_q or (peak_prob >= cfg.restrict_short_on_peak_prob and score < flat_low):
                 return "SHORT"
             elif flat_low < score < flat_high:
                 return "FLAT"
@@ -576,29 +639,34 @@ class M002FullArchitecture:
                 return "FLAT"
 
         out["action"] = out.apply(decide, axis=1)
+        if debug:
+            counts = out["action"].value_counts(normalize=True)
+            _dbg(
+                "action ratios "
+                + ", ".join(f"{k}:{counts.get(k,0.0):.2%}" for k in ["LONG", "SHORT", "FLAT"])
+            )
 
         # === 5️⃣ 포지션 사이즈 계산 ===
-        base = self.policy_cfg.size_k * effective_score / out["ex_ante_vol"]
-        out["position_size"] = np.where(out["action"] == "FLAT", 0.0, base)
-        out["position_size"] = np.clip(out["position_size"], -self.policy_cfg.size_max, self.policy_cfg.size_max).fillna(0.0)
+        base = cfg.size_k * effective_score / out["ex_ante_vol"]
+        pos = np.where(out["action"] == "FLAT", 0.0, base)
+        clipped = (
+            np.clip(pos, -cfg.size_max, cfg.size_max)
+            if len(out)
+            else pos
+        )
+        out["position_size"] = pd.Series(clipped, index=out.index).fillna(0.0)
+        if debug:
+            long_sizes = out.loc[out["action"] == "LONG", "position_size"].abs()
+            _dbg(
+                f"position_size |mean|={float(long_sizes.mean() or 0.0):.4f}, "
+                f"|max|={float(long_sizes.max() or 0.0):.4f}"
+            )
 
         return out
 
     # ---------- Inference ----------
 
-    def predict(self, df: pl.DataFrame) -> pd.DataFrame:
-        """
-        Predict per-row:
-          - pred_rebound_prob
-          - pred_expected_ret_pct
-          - pred_expected_dd_pct
-          - policy_score
-          - action, position_size
-        Returns pandas DataFrame aligned to input rows.
-        """
-        if self.head_model is None or self.head_multi is None:
-            raise RuntimeError("Model is not trained. Call train() first.")
-        
+    def _prepare_policy_frame(self, df: pl.DataFrame) -> pd.DataFrame:
         df = df.sort(["ticker", "date"])
 
         # Join state probabilities
@@ -644,7 +712,102 @@ class M002FullArchitecture:
         for col in needed_for_policy - set(pdf.columns):
             pdf[col] = 0.0
 
+        return pdf
+
+    def predict(self, df: pl.DataFrame) -> pd.DataFrame:
+        """
+        Predict per-row:
+          - pred_rebound_prob
+          - pred_expected_ret_pct
+          - pred_expected_dd_pct
+          - policy_score
+          - action, position_size
+        Returns pandas DataFrame aligned to input rows.
+        """
+        if self.head_model is None or self.head_multi is None:
+            raise RuntimeError("Model is not trained. Call train() first.")
+
+        pdf = self._prepare_policy_frame(df)
         return self._apply_policy(pdf)
+
+    def _evaluate_policy_cfg(
+        self,
+        policy_df: pd.DataFrame,
+        cfg: PolicyConfig,
+    ) -> Dict[str, float]:
+        applied = self._apply_policy(policy_df.copy(), policy_cfg=cfg)
+        counts = applied["action"].value_counts(normalize=True)
+        long_ratio = float(counts.get("LONG", 0.0))
+        short_ratio = float(counts.get("SHORT", 0.0))
+        flat_ratio = float(counts.get("FLAT", 0.0))
+        long_sizes = applied.loc[applied["action"] == "LONG", "position_size"].abs()
+        long_size_mean = float(long_sizes.mean() or 0.0)
+        policy_mean = float(applied["policy_score"].mean() or 0.0)
+        result = dict(
+            long_ratio=long_ratio,
+            short_ratio=short_ratio,
+            flat_ratio=flat_ratio,
+            long_size_mean=long_size_mean,
+            policy_mean=policy_mean,
+        )
+        target_long = 1 - cfg.target_short_ratio - cfg.target_flat_ratio
+        err = (
+            (long_ratio - target_long) ** 2
+            + (short_ratio - cfg.target_short_ratio) ** 2
+            + (flat_ratio - cfg.target_flat_ratio) ** 2
+        )
+        size_penalty = max(0.15 - long_size_mean, 0.0) ** 2
+        result["score"] = -err - size_penalty + policy_mean
+        return result
+
+    def train_policy_only(
+        self,
+        df: Optional[pl.DataFrame] = None,
+        score_scale_grid: Optional[Sequence[float]] = None,
+        size_k_grid: Optional[Sequence[float]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Re-calibrate policy hyperparameters (score_scale, size_k) while keeping
+        trained regime/head models fixed. Returns summary for the best config.
+        """
+        if self.head_model is None or self.head_multi is None:
+            raise RuntimeError("Head models must be trained before policy tuning.")
+
+        if df is None:
+            df = self._load_base_dataframe()
+
+        policy_df = self._prepare_policy_frame(df)
+        score_scale_grid = tuple(score_scale_grid or [0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 3.0])
+        size_k_grid = tuple(size_k_grid or [0.5, 0.8, 1.0, 1.2, 1.5])
+
+        best_cfg = deepcopy(self.policy_cfg)
+        best_summary: Dict[str, Any] = {}
+        best_score = -np.inf
+        history: List[Dict[str, Any]] = []
+
+        for score_scale in score_scale_grid:
+            for size_k in size_k_grid:
+                candidate = deepcopy(self.policy_cfg)
+                candidate.score_scale = float(score_scale)
+                candidate.size_k = float(size_k)
+                summary = self._evaluate_policy_cfg(policy_df, candidate)
+                summary.update({"score_scale": score_scale, "size_k": size_k})
+                history.append(summary)
+                if summary["score"] > best_score:
+                    best_score = summary["score"]
+                    best_cfg = deepcopy(candidate)
+                    best_summary = summary
+
+        self.policy_cfg = best_cfg
+        self.trained_state.setdefault("policy", {})
+        self.trained_state["policy"].update(
+            {"best_summary": best_summary, "history": history}
+        )
+        return {
+            "best_config": best_cfg,
+            "best_summary": best_summary,
+            "history": history,
+        }
 
 
 # ---------------------------
