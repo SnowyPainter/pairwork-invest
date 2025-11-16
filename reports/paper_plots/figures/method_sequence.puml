@@ -1,0 +1,61 @@
+@startuml method_sequence
+skinparam backgroundColor #ffffff
+skinparam roundcorner 15
+skinparam sequenceParticipant underline
+skinparam sequenceMessageAlign center
+
+title M002 Trading Pipeline Sequence Diagram
+
+actor "Market Data" as Market
+participant "Input Features" as Features
+participant "Morphological\nLabeler" as Labeler
+participant "LSTM\nModel" as LSTM
+participant "LightGBM\nPolicy Head" as LightGBM
+participant "Policy\nCalculator" as Policy
+participant "EOD\nSignal" as Signal
+participant "Execution\nSystem" as Exec
+participant "Backtest\nEngine" as Backtest
+
+== Feature Engineering ==
+Market -> Features: Raw OHLCV data
+note right: Curvature, Slope, RSI, Volume, etc.
+
+== Regime Classification ==
+Features -> Labeler: Feature vector
+Labeler -> Labeler: Morphological analysis
+Labeler -> LSTM: Feature sequence
+LSTM -> LSTM: Process temporal patterns
+LSTM -> Labeler: Pr(Regime)
+note right: 5 regime states
+
+== Prediction & Policy ==
+Labeler -> LightGBM: Regime probs + raw features
+LightGBM -> LightGBM: Multi-output regression
+LightGBM -> Policy: E[ret5D], E[dd5D], rebound prob
+
+== Decision Making ==
+Policy -> Policy: Calculate utility score S
+Policy -> Signal: LONG / FLAT / SHORT
+note right: prob * ret - λ · drawdown
+
+== Execution ==
+Signal -> Exec: EOD signal
+Exec -> Exec: Next day execution
+Exec -> Backtest: Fill prices & P&L
+
+== Performance Analysis ==
+Backtest -> Backtest: Calculate metrics
+Backtest -> Backtest: Risk-adjusted returns
+
+legend right
+M002 Pipeline Flow:
+1. Feature extraction from market data
+2. Morphological regime labeling
+3. LSTM regime probability estimation
+4. LightGBM prediction head
+5. Policy scoring and position sizing
+6. End-of-day signal generation
+7. Next-day execution and backtesting
+end legend
+
+@enduml

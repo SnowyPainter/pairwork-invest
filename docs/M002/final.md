@@ -88,16 +88,18 @@ Regime 확률과 확장 특성을 결합해, 향후 5일 **리바운드 확률**
 
 ## 4. Results
 
-미국 종목군 백테스트 요약(집계, reports/m002_full_backtest_btpy/summary_agg.csv 기준):
+미국 종목군(2000~2018, 최대 100개 티커) 백테스트를 robust 조건(#Trades ≥ 30, |MaxDD| ≥ 1%)으로 집계하면:
 
-- Profit Factor: mean ≈ 3.91, median ≈ 0.88
-- Calmar Ratio: mean ≈ 21.48
-- Beta: mean ≈ 0.17
-- Max Drawdown: median ≈ −25.15%
-- Win Rate: mean ≈ 50.4%
-- Exposure Time: mean ≈ 62.7% (롱 온리 운용)
+| Metric | Value |
+| --- | --- |
+| Profit Factor | **1.10** |
+| Calmar Ratio | **0.38** |
+| Beta | **0.04** |
+| Win Rate | **46.0%** |
+| Avg. Trade [%] | **−0.28% (median −0.02%)** |
+| Avg. Drawdown [%] | **−10.4% (median −6.8%)** |
 
-단순 승률이 비슷하더라도, 정책 점수와 위험 제약을 결합한 손익비 개선으로 성과가 도출됨을 확인했다.
+노출(Exposure)과 변동성은 억제되었지만, Sharpe·CAGR·Expectancy가 모두 음수라 **“안정적인 손실”** 패턴으로 판단된다. Worst trade가 −47%, median Max Drawdown이 −27% 수준이라, tail risk는 여전히 존재한다. 일부 annualized 지표는 표본 민감도가 크므로 해석 시 주의가 필요하다.
 
 ---
 
