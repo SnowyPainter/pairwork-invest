@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-형태학적 5국면 오버레이 플롯.
+이벤트 및 국면 오버레이 차트 생성.
 
-M002 형태학 라벨(Accumulation~LateDown)을 가격 위에 밴드로 겹쳐서,
-곡률/이벤트가 국면에 따라 어떻게 분포하는지 직관적으로 보여준다.
+지정된 기간 동안의 가격 차트에 M002 휴리스틱 국면들과 이벤트들을 함께 표시합니다.
 """
 
 from __future__ import annotations
@@ -46,17 +45,16 @@ STATE_COLORS = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="형태학적 5국면 라벨을 가격 위에 오버레이하는 플롯 생성.",
+        description="1개월 이벤트 차트 생성.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--ticker", default="AAPL", help="Yahoo Finance 티커 심볼")
-    parser.add_argument("--start", default="2020-01-01", help="시작일 (YYYY-MM-DD)")
-    parser.add_argument("--end", default="2022-12-31", help="종료일 (YYYY-MM-DD)")
+    parser.add_argument("--start", default="2023-01-01", help="시작일 (YYYY-MM-DD)")
+    parser.add_argument("--end", default="2023-12-31", help="종료일 (YYYY-MM-DD)")
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("reports/paper_plots/morphology_overlay.png"),
-        help="플롯 저장 경로",
+        help="플롯 저장 경로 (기본값: reports/paper_plots/{ticker}_{start}_{end}_events.png)",
     )
     parser.add_argument("--log-level", default="INFO", help="로그 레벨")
     return parser.parse_args()
@@ -82,7 +80,7 @@ def load_morphology_frame(
     # Build features
     feature_df = build_feature_frame(ohlcv, feature_set="m002")
 
-    # Assign regime labels
+    # Assign regime labels for overlay
     feature_df = _assign_regime_labels(feature_df)
 
     # Convert to pandas and prepare for plotting
@@ -107,19 +105,20 @@ def _segments(dates: Iterable[pd.Timestamp], states: Iterable[str]) -> Iterable[
     yield prev_state, dates[start_idx], dates[-1]
 
 
-def plot_morphology(df: pd.DataFrame, ticker: str, output: Path) -> None:
+def plot_morphology(df: pd.DataFrame, ticker: str, output: Path, start_date: str, end_date: str) -> None:
     dates = df["date"]
-    fig, ax = plt.subplots(1, 1, figsize=(14, 8), constrained_layout=True)
+    fig, ax = plt.subplots(1, 1, figsize=(10, 6), constrained_layout=True)
 
-    # Price overlay with regime states and events
+    # Price chart with regime overlay and events
     ax.plot(dates, df["close"], color="#2c3e50", linewidth=1.5, label="Close")
 
+    # Add regime overlay bands
     for state, start, end in _segments(dates, df["regime_state"]):
         ax.axvspan(
             start,
             end,
             color=STATE_COLORS.get(state, "#bdc3c7"),
-            alpha=0.18,
+            alpha=0.15,
             label=state if state not in ax.get_legend_handles_labels()[1] else None,
         )
 
@@ -173,14 +172,14 @@ def plot_morphology(df: pd.DataFrame, ticker: str, output: Path) -> None:
                                   arrowprops=dict(arrowstyle='<->', color='red', alpha=0.7, linewidth=2),
                                   zorder=6)
 
-    ax.set_title(f"{ticker} – Morphology-Based 5 Regime Overlay")
+    ax.set_title(f"{ticker} Events & Regimes ({start_date} to {end_date})", fontsize=14, fontweight='bold')
     ax.set_ylabel("Price")
     ax.set_xlabel("Date")
     ax.grid(True, linewidth=0.3, alpha=0.4)
 
     handles, labels = ax.get_legend_handles_labels()
     by_label = dict(zip(labels, handles))
-    ax.legend(by_label.values(), by_label.keys(), loc="upper left", ncol=4, fontsize=12, framealpha=0.9)
+    ax.legend(by_label.values(), by_label.keys(), loc="upper left", ncol=6, fontsize=9, framealpha=0.9)
 
     ax.xaxis.set_major_locator(mdates.AutoDateLocator())
     ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(mdates.AutoDateLocator()))
@@ -195,6 +194,14 @@ def main() -> None:
     args = parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(message)s")
 
+    # Generate dynamic filename if not specified
+    if args.output is None:
+        # Convert dates to filename-safe format (remove hyphens)
+        start_clean = args.start.replace('-', '')
+        end_clean = args.end.replace('-', '')
+        filename = f"{args.ticker}_{start_clean}_{end_clean}_events.png"
+        args.output = Path("reports/paper_plots") / filename
+
     df = load_morphology_frame(
         ticker=args.ticker,
         start=args.start,
@@ -203,13 +210,22 @@ def main() -> None:
     if df.empty:
         raise SystemExit("데이터가 비어 있습니다. 기간 또는 티커를 확인하세요.")
 
-    # Log regime distribution
-    import polars as pl
-    regime_counts = pl.from_pandas(df).group_by("regime_state").len().sort("len", descending=True)
-    logging.info("✅ Regime Label Distribution:")
-    logging.info(regime_counts)
+    # Count events
+    event_cols = [col for col in df.columns if col.startswith('event_')]
+    if event_cols:
+        event_counts = df[event_cols].sum().sort_values(ascending=False)
+        total_events = event_counts.sum()
+        if total_events > 0:
+            logging.info(f"✅ Event Summary ({args.start} to {args.end}): {int(total_events)} events found")
+            for event, count in event_counts.items():
+                if count > 0:
+                    logging.info(f"  {event}: {int(count)}")
+        else:
+            logging.info(f"ℹ️  선택된 기간({args.start} to {args.end})에 이벤트가 없습니다.")
+    else:
+        logging.info("ℹ️  이벤트 컬럼을 찾을 수 없습니다.")
 
-    plot_morphology(df, args.ticker, args.output)
+    plot_morphology(df, args.ticker, args.output, args.start, args.end)
 
 
 if __name__ == "__main__":
