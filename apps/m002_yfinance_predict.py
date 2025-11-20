@@ -322,7 +322,27 @@ def load_m002_model(path: Path) -> M002FullArchitecture:
             "joblib is required to load the saved model. Install it with `pip install joblib`."
         )
 
-    model = joblib.load(path)
+    # Ensure torch tensors are moved to CPU even if the pickle was created on GPU
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - torch should be installed already
+        torch = None
+
+    if torch is not None:
+        original_torch_load = torch.load
+
+        def _cpu_load(*args, **kwargs):
+            kwargs.setdefault("map_location", torch.device("cpu"))
+            return original_torch_load(*args, **kwargs)
+
+        torch.load = _cpu_load
+
+    try:
+        model = joblib.load(path)
+    finally:
+        if torch is not None:
+            torch.load = original_torch_load
+
     if not isinstance(model, M002FullArchitecture):
         raise TypeError(f"Unexpected object loaded from {path}: {type(model)!r}")
 
