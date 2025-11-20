@@ -225,50 +225,48 @@ def plot_comparison(df: pd.DataFrame, ticker: str, output: Path, eval_horizon: i
     df = df.copy()
     df["position_size"] = df.get("position_size", 0.0).fillna(0.0)
 
-    fig, axes = plt.subplots(3, 1, sharex=True, figsize=(14, 9), constrained_layout=True)
+    fig, axes = plt.subplots(2, 1, sharex=True, figsize=(14, 8), constrained_layout=True)
 
-    # Price + regime boundaries
-    ax_price = axes[0]
-    ax_price.plot(date_series, df["close"], color="#34495e", linewidth=1.5, label="Close")
-    seen_labels = set()
-    for state, start, end in _state_segments(date_series.to_numpy(), df["lstm_state"]):
-        color = LSTM_STATE_COLORS.get(state, "#bdc3c7")
-        label = f"LSTM {state}" if state not in seen_labels else None
-        ax_price.axvspan(start, end, color=color, alpha=0.18, label=label)
-        seen_labels.add(state)
-    hmm_transitions = [
-        date_series[i]
-        for i in range(1, len(df))
-        if df["hmm_state"].iloc[i] != df["hmm_state"].iloc[i - 1]
-    ]
-    for x in hmm_transitions:
-        ax_price.axvline(x, color="#2c3e50", linestyle="--", linewidth=0.8, alpha=0.4)
-    ax_price.set_ylabel("Price")
-    ax_price.set_title(f"{ticker} 가격 및 국면 전이")
-    handles, labels = ax_price.get_legend_handles_labels()
-    ax_price.legend(handles, labels, loc="upper left", ncol=3)
-    ax_price.grid(True, linewidth=0.3, alpha=0.4)
-
-    # LSTM probability landscape vs HMM boundaries
-    ax_prob = axes[1]
+    # LSTM probability landscape with price overlay
+    ax_prob = axes[0]
     prob_arrays = [df.get(f"state_prob_{state}", pd.Series([0.0] * len(df))).to_numpy() for state in LSTM_STATE_ORDER]
     ax_prob.stackplot(
         date_series,
         *prob_arrays,
         labels=LSTM_STATE_ORDER,
         colors=[LSTM_STATE_COLORS.get(state, "#cccccc") for state in LSTM_STATE_ORDER],
-        alpha=0.8,
+        alpha=0.7,
     )
+
+    # Add price line on secondary y-axis
+    ax_price_secondary = ax_prob.twinx()
+    price_line = ax_price_secondary.plot(date_series, df["close"], color="#2c3e50", linewidth=1.2,
+                                        label="Price", alpha=0.8)
+    ax_price_secondary.set_ylabel("Price", color="#2c3e50")
+    ax_price_secondary.tick_params(axis='y', labelcolor="#2c3e50")
+
+    hmm_transitions = [
+        date_series[i]
+        for i in range(1, len(df))
+        if df["hmm_state"].iloc[i] != df["hmm_state"].iloc[i - 1]
+    ]
     for x in hmm_transitions:
-        ax_prob.axvline(x, color="#2c3e50", linestyle="--", linewidth=0.6, alpha=0.4)
+        ax_prob.axvline(x, color="#2c3e50", linestyle="--", linewidth=0.8, alpha=0.5)
+
     ax_prob.set_ylim(0, 1)
     ax_prob.set_ylabel("LSTM Regime Prob.")
-    ax_prob.set_title("LSTM 기반 확률 모델: 부드러운 전이")
-    ax_prob.legend(loc="upper left", ncol=5)
+    ax_prob.set_title("LSTM 확률 모델 + 가격 vs HMM 국면 전이")
+
+    # Combine legends from both axes
+    prob_handles, prob_labels = ax_prob.get_legend_handles_labels()
+    price_handles, price_labels = ax_price_secondary.get_legend_handles_labels()
+    combined_handles = prob_handles + price_handles
+    combined_labels = prob_labels + price_labels
+    ax_prob.legend(combined_handles, combined_labels, loc="upper left", ncol=6, fontsize=8)
     ax_prob.grid(True, linewidth=0.3, alpha=0.4)
 
     # Rolling accuracy
-    ax_roll = axes[2]
+    ax_roll = axes[1]
     window = max(1, int(eval_horizon))
     model_roll = df["model_correct"].rolling(window, min_periods=max(5, window // 2)).mean().ffill().bfill()
     hmm_roll = df["hmm_correct"].rolling(window, min_periods=max(5, window // 2)).mean().ffill().bfill()
@@ -280,8 +278,8 @@ def plot_comparison(df: pd.DataFrame, ticker: str, output: Path, eval_horizon: i
     ax_roll.grid(True, linewidth=0.3, alpha=0.4)
     ax_roll.legend(loc="upper left")
 
-    axes[-1].xaxis.set_major_locator(mdates.AutoDateLocator())
-    axes[-1].xaxis.set_major_formatter(mdates.ConciseDateFormatter(mdates.AutoDateLocator()))
+    axes[1].xaxis.set_major_locator(mdates.AutoDateLocator())
+    axes[1].xaxis.set_major_formatter(mdates.ConciseDateFormatter(mdates.AutoDateLocator()))
 
     fig.suptitle(f"{ticker} — HMM vs. 3계층 분석 모델", fontsize=16, fontweight="bold")
     output.parent.mkdir(parents=True, exist_ok=True)
